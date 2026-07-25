@@ -1,0 +1,162 @@
+name: Build linux-tkg (Debian/Devuan)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "Kernel version (e.g. 6.13-latest, or a tag like v6.12.8)"
+        required: true
+        default: "6.12-latest"
+      cpu_scheduler:
+        description: "CPU scheduler"
+        required: true
+        type: choice
+        default: "eevdf"
+        options:
+          - eevdf
+          - bore
+          - pds
+          - bmq
+          - cfs
+      compiler:
+        description: "Compiler"
+        required: true
+        type: choice
+        default: "gcc"
+        options:
+          - gcc
+          - llvm
+      opt_level:
+        description: "Compiler optimization"
+        required: true
+        type: choice
+        default: "1"
+        options:
+          - "1"   # -O2, performance (kernel default)
+          - "2"   # -O3, optimize harder
+          - "3"   # -Os, optimize for size
+      timer_freq:
+        description: "Timer frequency (Hz)"
+        required: true
+        type: choice
+        default: "1000"
+        options:
+          - "100"
+          - "250"
+          - "300"
+          - "500"
+          - "750"
+          - "1000"
+      cpu_governor:
+        description: "Default CPU governor"
+        required: true
+        type: choice
+        default: "schedutil"
+        options:
+          - schedutil
+          - ondemand
+          - performance
+      preempt_rt:
+        description: "Apply PREEMPT_RT patchset (only compatible with cfs scheduler)"
+        required: true
+        type: choice
+        default: "no"
+        options:
+          - "no"
+          - "yes"
+      kernel_localversion:
+        description: "Custom kernel localversion tag (optional, e.g. 'devuan')"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # stay under GH Actions' 6h hard job limit
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h
+
+      - name: Clone linux-tkg
+        run: git clone --depth 1 https://github.com/Frogging-Family/linux-tkg.git
+
+      - name: Write override config
+        # install.sh automatically sources ~/.config/frogminer/linux-tkg.cfg
+        # and lets its values override customization.cfg - no need to edit
+        # the repo's own files.
+        run: |
+          mkdir -p ~/.config/frogminer
+
+          rt_value=""
+          if [ "${{ inputs.preempt_rt }}" = "yes" ]; then
+            rt_value="1"
+          fi
+
+          cat > ~/.config/frogminer/linux-tkg.cfg <<EOF
+          _distro="Debian"
+          _version="${{ inputs.kernel_version }}"
+          _cpusched="${{ inputs.cpu_scheduler }}"
+          _compiler="${{ inputs.compiler }}"
+          _compileroptlevel="${{ inputs.opt_level }}"
+          _timer_freq="${{ inputs.timer_freq }}"
+          _default_cpu_gov="${{ inputs.cpu_governor }}"
+          _preempt_rt="${rt_value}"
+          _preempt_rt_force="0"
+          _kernel_localversion="${{ inputs.kernel_localversion }}"
+          _processor_opt="x86-64"
+          _sched_yield_type="1"
+          _rr_interval="default"
+          _tickless="2"
+          _acs_override="false"
+          _smt_nice="true"
+          _lto_mode="no"
+          _install_after_building="no"
+          _logging_use_script="no"
+          _menunconfig="false"
+          _diffconfig="false"
+          _modprobeddb="false"
+          _kernel_on_diet="false"
+          _user_patches="false"
+          _config_fragments="false"
+          EOF
+
+          echo "---- Effective override config ----"
+          cat ~/.config/frogminer/linux-tkg.cfg
+
+      - name: Set up ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache --max-size=5G
+
+      - name: Cache ccache directory
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: tkg-ccache-${{ inputs.kernel_version }}-${{ inputs.cpu_scheduler }}-${{ inputs.compiler }}
+          restore-keys: |
+            tkg-ccache-${{ inputs.kernel_version }}-
+            tkg-ccache-
+
+      - name: Build kernel (.deb packages)
+        working-directory: linux-tkg
+        run: |
+          # install.sh installs its own apt dependency list, then
+          # clones the kernel source, patches it, configures it,
+          # and runs 'make bindeb-pkg'.
+          ./install.sh install
+
+      - name: List built packages
+        run: find linux-tkg/DEBS -maxdepth 1 -iname "*.deb" -print
+
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-tkg-debs-${{ inputs.kernel_version }}-${{ inputs.cpu_scheduler }}
+          path: linux-tkg/DEBS/*.deb
+          if-no-files-found: error
+          retention-days: 14
