@@ -150,6 +150,8 @@ jobs:
               ;;
           esac
 
+          localversion_sanitized=$(echo "${{ inputs.kernel_localversion }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9+.-]/-/g')
+
           cat > ~/.config/frogminer/linux-tkg.cfg <<EOF
           _distro="Debian"
           _version="${{ inputs.kernel_version }}"
@@ -163,7 +165,7 @@ jobs:
           _modprobeddb="${modprobeddb_value}"
           _modprobeddb_db_path="$GITHUB_WORKSPACE/modprobed.db"
           _kernel_on_diet="${kernel_on_diet_value}"
-          _kernel_localversion="${{ inputs.kernel_localversion }}"
+          _kernel_localversion="${localversion_sanitized}"
           _processor_opt="${{ inputs.cpu_arch }}"
           _sched_yield_type="1"
           _rr_interval="default"
