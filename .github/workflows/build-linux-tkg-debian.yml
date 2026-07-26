@@ -64,6 +64,15 @@ on:
         options:
           - "no"
           - "yes"
+      module_trimming:
+        description: "Trim unused kernel modules for faster builds. 'modprobed-db' needs modprobed.db committed at the repo root (see README); 'diet' uses linux-tkg's built-in common-modules list, no setup needed"
+        required: true
+        type: choice
+        default: "none"
+        options:
+          - none
+          - modprobed-db
+          - diet
       cpu_arch:
         description: "Target CPU microarchitecture (pick 'x86-64' or a 'v2/v3/v4' level if this kernel needs to run on multiple different machines - specific CPU names pin it to that one CPU family, and 'native' targets the GitHub runner's CPU, not yours)"
         required: true
@@ -102,8 +111,17 @@ jobs:
             /opt/hostedtoolcache/CodeQL 2>/dev/null || true
           df -h
 
+      - name: Checkout this repo (for modprobed.db, if used)
+        uses: actions/checkout@v4
+
       - name: Clone linux-tkg
         run: git clone --depth 1 https://github.com/Frogging-Family/linux-tkg.git
+
+      - name: Show linux-tkg commit used
+        working-directory: linux-tkg
+        run: |
+          echo "Building with linux-tkg commit:"
+          git log -1 --format="%H  (%ci)  %s"
 
       - name: Write override config
         # install.sh automatically sources ~/.config/frogminer/linux-tkg.cfg
@@ -117,6 +135,21 @@ jobs:
             rt_value="1"
           fi
 
+          modprobeddb_value="false"
+          kernel_on_diet_value="false"
+          case "${{ inputs.module_trimming }}" in
+            modprobed-db)
+              modprobeddb_value="true"
+              if [ ! -f "$GITHUB_WORKSPACE/modprobed.db" ]; then
+                echo "::error::module_trimming was set to 'modprobed-db' but modprobed.db was not found at the repo root. Commit it first, or choose 'diet'/'none' instead."
+                exit 1
+              fi
+              ;;
+            diet)
+              kernel_on_diet_value="true"
+              ;;
+          esac
+
           cat > ~/.config/frogminer/linux-tkg.cfg <<EOF
           _distro="Debian"
           _version="${{ inputs.kernel_version }}"
@@ -127,6 +160,9 @@ jobs:
           _default_cpu_gov="${{ inputs.cpu_governor }}"
           _preempt_rt="${rt_value}"
           _preempt_rt_force="0"
+          _modprobeddb="${modprobeddb_value}"
+          _modprobeddb_db_path="$GITHUB_WORKSPACE/modprobed.db"
+          _kernel_on_diet="${kernel_on_diet_value}"
           _kernel_localversion="${{ inputs.kernel_localversion }}"
           _processor_opt="${{ inputs.cpu_arch }}"
           _sched_yield_type="1"
@@ -139,8 +175,6 @@ jobs:
           _logging_use_script="no"
           _menunconfig="false"
           _diffconfig="false"
-          _modprobeddb="false"
-          _kernel_on_diet="false"
           _user_patches="false"
           _config_fragments="false"
           EOF
