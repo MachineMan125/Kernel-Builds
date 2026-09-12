@@ -81,6 +81,8 @@ on:
         options:
           - x86-64        # safest - runs on any x86_64 CPU
           - x86-64-v2     # baseline for CPUs newer than ~2008
+          - sandybridge   # <- add
+          - ivybridge     # <- add
           - x86-64-v3     # baseline for CPUs newer than ~2013
           - x86-64-v4     # Intel Skylake+ / AMD Zen4+
           - alderlake     # Intel Core 12th gen
