@@ -12,7 +12,7 @@ on:
       kernel_version:
         description: "Kernel version (e.g. 6.13-latest, or a tag like v6.12.8)"
         required: true
-        default: "6.12-latest"
+        default: "7.2-latest"
       cpu_scheduler:
         description: "CPU scheduler. 'cfs' and 'cfs + PREEMPT_RT' only work on kernels 6.5 and older; 6.6+ must use eevdf/bore/pds/bmq"
         required: true
@@ -80,6 +80,7 @@ on:
         options:
           - x86-64         # safest - runs on any x86_64 CPU
           - x86-64-v2      # baseline for CPUs newer than ~2008
+          - westmere       # Intel Core 1st gen (Arrandale/Clarkdale)
           - sandybridge    # Intel Core 2nd gen
           - ivybridge      # Intel Core 3rd gen
           - x86-64-v3      # baseline for CPUs newer than ~2013
