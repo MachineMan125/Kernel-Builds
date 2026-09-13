@@ -1,0 +1,349 @@
+# Upload to .github/workflows/build-cachyos-nuc7.yml on your default branch.
+# REQUIRED: configs/nuc7.config exported from a working kernel ON THE NUC:
+#   cp "/boot/config-$(uname -r)" "$HOME/nuc7.config"
+# Commit that file as configs/nuc7.config. No TKG files/scripts are required.
+#
+# Builds CachyOS source with a Devuan-derived configuration, NOT the official
+# Arch binary configuration. No LTO, AutoFDO, module trimming, or sched_ext.
+# Keep your working Devuan/TKG kernel installed. Packages are not Secure-Boot
+# signed/enrolled for your firmware; handle signing separately if required.
+#
+# Reviewed source: https://github.com/CachyOS/linux/tree/58df0ae8769fd82381f9b183acada418cf179adb
+# That commit is cachyos-6.18.51-2. Update the tag AND SHA deliberately for fixes.
+# x86-64-v3 is for the stated i5-7300U; these packages are NOT for the Z220/E6410.
+name: Build CachyOS LTS - NUC7 Devuan
+
+on:
+  workflow_dispatch:
+    inputs:
+      cpu_target:
+        description: 'NUC i5-7300U: x86-64-v3. Generic x86-64 is available as a fallback.'
+        type: choice
+        required: true
+        default: x86-64-v3
+        options: [x86-64-v3, x86-64]
+      timer_hz:
+        description: 'Timer frequency; start with 500 Hz'
+        type: choice
+        required: true
+        default: '500'
+        options: ['300', '500', '1000']
+      build_jobs:
+        description: 'auto limits jobs by runner CPU/RAM; lower this after an out-of-memory failure'
+        type: choice
+        required: true
+        default: auto
+        options: [auto, '2', '4']
+
+permissions:
+  contents: read
+
+# Different runs are allowed to finish; no pending run silently replaces another.
+# Be mindful of private-repository Actions usage when dispatching repeatedly.
+concurrency:
+  group: cachyos-nuc7-${{ github.run_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+env:
+  CACHY_REPO: https://github.com/CachyOS/linux.git
+  CACHY_TAG: cachyos-6.18.51-2
+  CACHY_COMMIT: 58df0ae8769fd82381f9b183acada418cf179adb
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  ARCH: x86
+  KBUILD_DEBARCH: amd64
+  KBUILD_BUILD_USER: nuc7-builder
+  KBUILD_BUILD_HOST: github-actions
+  KBUILD_BUILD_VERSION: '1'
+  DEBFULLNAME: NUC7 Kernel Builder
+  DEBEMAIL: kernel-builder@localhost
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout your private repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate setup and inputs
+        env:
+          CPU_TARGET: ${{ inputs.cpu_target }}
+          TIMER_HZ: ${{ inputs.timer_hz }}
+          JOBS_INPUT: ${{ inputs.build_jobs }}
+        run: |
+          mkdir -p dist/metadata
+          python3 - <<'PY'
+          import os, pathlib, re, json
+          e=os.environ
+          p=pathlib.Path('configs/nuc7.config')
+          if not p.is_file():
+              raise SystemExit('Missing configs/nuc7.config. Export /boot/config-$(uname -r) ON THE NUC and commit it at this path.')
+          s=p.read_text()
+          for item in ('CONFIG_X86_64=y','CONFIG_MODULES=y','CONFIG_BLK_DEV_INITRD=y'):
+              if item not in s.splitlines(): raise SystemExit('Baseline is missing '+item)
+          if e['CPU_TARGET'] not in ('x86-64-v3','x86-64'): raise SystemExit('Invalid CPU target')
+          if e['TIMER_HZ'] not in ('300','500','1000'): raise SystemExit('Invalid timer frequency')
+          if e['JOBS_INPUT'] not in ('auto','2','4'): raise SystemExit('Invalid job count')
+          if not re.fullmatch('[0-9a-f]{40}',e['CACHY_COMMIT']): raise SystemExit('Expected a full source commit SHA')
+          if not re.fullmatch(r'cachyos-6\.18\.[0-9]+-[0-9]+',e['CACHY_TAG']): raise SystemExit('This workflow supports reviewed 6.18 LTS tags only')
+          suffix='-cachyos-nuc7-r'+e['GITHUB_RUN_ID']+'a'+e['GITHUB_RUN_ATTEMPT']
+          values={'LOCALVERSION':suffix, 'NUC_ISA_LEVEL':'3' if e['CPU_TARGET']=='x86-64-v3' else '1', 'NUC_TIMER_HZ':e['TIMER_HZ']}
+          with open(e['GITHUB_ENV'],'a') as f:
+              for k,v in values.items(): f.write(k+'='+v+'\n')
+          pathlib.Path('dist/metadata/inputs.json').write_text(json.dumps({**values,'source_tag':e['CACHY_TAG'],'source_commit':e['CACHY_COMMIT'],'jobs':e['JOBS_INPUT']},indent=2)+'\n')
+          PY
+          cp configs/nuc7.config dist/metadata/base.config
+
+      - name: Make room on the hosted runner
+        run: |
+          # Only disposable, GitHub-hosted runner SDKs; never run on the NUC.
+          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/lib/android /opt/ghc
+          df -h .
+          available_kb=$(df -Pk . | awk 'NR==2 {print $4}')
+          if (( available_kb < 35 * 1024 * 1024 )); then
+            echo '::error::Need at least 35 GiB free before fetching kernel sources.'
+            exit 1
+          fi
+
+      - name: Install Debian package build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc-x86-64-linux-gnu bc bison flex \
+            libssl-dev libelf-dev libdw-dev libncurses-dev \
+            dwarves zstd xz-utils lz4 cpio rsync kmod \
+            git ca-certificates python3 debhelper dpkg-dev fakeroot ccache
+          echo /usr/lib/ccache >> "$GITHUB_PATH"
+          {
+            gcc --version
+            ld --version
+            ccache --version
+            dpkg-query -W gcc binutils libc6-dev dpkg-dev debhelper dwarves
+            printf 'Runner: %s %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+          } > dist/metadata/toolchain.txt
+
+      - name: Fetch exact CachyOS LTS source
+        run: |
+          git init -q kernel
+          git -C kernel remote add origin "$CACHY_REPO"
+          git -C kernel fetch --depth 1 origin "refs/tags/$CACHY_TAG"
+          git -C kernel checkout --detach FETCH_HEAD
+          actual=$(git -C kernel rev-parse HEAD)
+          if [[ "$actual" != "$CACHY_COMMIT" ]]; then
+            echo '::error::Source tag no longer matches the reviewed commit. Review tag and SHA together.'
+            exit 1
+          fi
+          git -C kernel log -1 --format=fuller > dist/metadata/source.txt
+          timestamp=$(git -C kernel show -s --format=%cD HEAD)
+          echo "KBUILD_BUILD_TIMESTAMP=$timestamp" >> "$GITHUB_ENV"
+          version=$(make -s -C kernel kernelversion)
+          [[ "$version" == 6.18.* ]] || { echo '::error::Unexpected kernel series'; exit 1; }
+          echo "$version" > dist/metadata/kernel-version.txt
+          echo "KERNEL_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Configure NUC7 kernel
+        working-directory: kernel
+        run: |
+          cp ../configs/nuc7.config .config
+          # Resolve renamed/removed options from the baseline before tuning.
+          make CC=gcc HOSTCC=gcc olddefconfig < /dev/null 2>&1 | tee ../dist/metadata/configure-initial.log
+          python3 - <<'PY'
+          import os, subprocess, pathlib, json
+          e=os.environ
+          # Keep broad device coverage from the baseline. No localmodconfig.
+          wanted={
+            '64BIT':'y','X86_64':'y','SMP':'y','NR_CPUS':'4',
+            'GENERIC_CPU':'y','X86_NATIVE_CPU':'n','MZEN4':'n',
+            'X86_64_VERSION':e['NUC_ISA_LEVEL'],
+            'CACHY':'y','SCHED_BORE':'n','SCHED_ALT':'n','SCHED_BMQ':'n',
+            'CC_OPTIMIZE_FOR_PERFORMANCE':'y','CC_OPTIMIZE_FOR_PERFORMANCE_O3':'n','CC_OPTIMIZE_FOR_SIZE':'n',
+            'LTO_NONE':'y','LTO_CLANG_FULL':'n','LTO_CLANG_THIN':'n',
+            'AUTOFDO_CLANG':'n','PROPELLER_CLANG':'n','RUST':'n',
+            'PREEMPT':'y','PREEMPT_DYNAMIC':'y','PREEMPT_RT':'n',
+            'PREEMPT_NONE':'n','PREEMPT_VOLUNTARY':'n','PREEMPT_LAZY':'n',
+            'NO_HZ_IDLE':'y','NO_HZ_FULL':'n','HZ_PERIODIC':'n',
+            'CPU_FREQ':'y','CPU_FREQ_DEFAULT_GOV_SCHEDUTIL':'y',
+            'CPU_FREQ_DEFAULT_GOV_PERFORMANCE':'n','CPU_FREQ_DEFAULT_GOV_ONDEMAND':'n',
+            'CPU_FREQ_DEFAULT_GOV_USERSPACE':'n','CPU_FREQ_DEFAULT_GOV_POWERSAVE':'n','CPU_FREQ_DEFAULT_GOV_CONSERVATIVE':'n',
+            'X86_INTEL_PSTATE':'y','CPU_FREQ_GOV_SCHEDUTIL':'y',
+            'MODULES':'y','BLK_DEV_INITRD':'y','DEVTMPFS':'y','DEVTMPFS_MOUNT':'y',
+            'EFI':'y','EFI_STUB':'y','EFI_PARTITION':'y',
+            'PCI':'y','ACPI':'y','DRM':'y','DRM_I915':'m',
+            'SATA_AHCI':'m','BLK_DEV_NVME':'m','EXT4_FS':'m',
+            'LOCALVERSION_AUTO':'n','CMDLINE_BOOL':'n','CMDLINE_OVERRIDE':'n',
+            'DEBUG_INFO_NONE':'y','DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT':'n',
+            'DEBUG_INFO_DWARF4':'n','DEBUG_INFO_DWARF5':'n',
+            'DEBUG_INFO_BTF':'n','DEBUG_INFO_BTF_MODULES':'n','SCHED_CLASS_EXT':'n',
+            'MODULE_SIG':'y','MODULE_SIG_ALL':'n','MODULE_SIG_FORCE':'n',
+            'PSI':'y','PSI_DEFAULT_DISABLED':'n'
+          }
+          # Select HZ through its source-defined choice; do not write derived HZ.
+          import re
+          for symbol in re.findall(r'^\s*config (HZ_\d+)\s*$',pathlib.Path('kernel/Kconfig.hz').read_text(),re.M):
+              wanted[symbol]='y' if symbol=='HZ_'+e['NUC_TIMER_HZ'] else 'n'
+          strings={'LOCALVERSION':'','CMDLINE':'','SYSTEM_TRUSTED_KEYS':'','SYSTEM_REVOCATION_KEYS':'','MODULE_SIG_KEY':'certs/signing_key.pem'}
+          for k,v in wanted.items():
+              args=['--enable',k] if v=='y' else ['--disable',k] if v=='n' else ['--module',k] if v=='m' else ['--set-val',k,v]
+              subprocess.run(['scripts/config',*args],check=True)
+          for k,v in strings.items(): subprocess.run(['scripts/config','--set-str',k,v],check=True)
+          pathlib.Path('../dist/metadata/requested-config.json').write_text(json.dumps({'options':wanted,'strings':strings},indent=2)+'\n')
+          PY
+          make CC=gcc HOSTCC=gcc olddefconfig < /dev/null 2>&1 | tee ../dist/metadata/configure-final.log
+          cp .config ../dist/metadata/final.config
+          scripts/diffconfig ../configs/nuc7.config .config > ../dist/metadata/config-diff.txt
+
+      - name: Validate final configuration
+        working-directory: kernel
+        run: |
+          python3 - <<'PY'
+          import pathlib,re,os,json
+          e=os.environ
+          cfg=dict(re.findall(r'^(CONFIG_\w+)=(.*)$',pathlib.Path('.config').read_text(),re.M))
+          required={'X86_64':'y','SMP':'y','NR_CPUS':'4','GENERIC_CPU':'y',
+                    'X86_64_VERSION':e['NUC_ISA_LEVEL'],'CACHY':'y',
+                    'CC_OPTIMIZE_FOR_PERFORMANCE':'y','PREEMPT':'y','PREEMPT_DYNAMIC':'y',
+                    'NO_HZ_IDLE':'y','HZ':e['NUC_TIMER_HZ'],
+                    'X86_INTEL_PSTATE':'y','CPU_FREQ_DEFAULT_GOV_SCHEDUTIL':'y',
+                    'MODULES':'y','BLK_DEV_INITRD':'y','DEVTMPFS':'y',
+                    'EFI':'y','EFI_STUB':'y','DRM_I915':'m',
+                    'SATA_AHCI':'m','BLK_DEV_NVME':'m','EXT4_FS':'m','DEBUG_INFO_NONE':'y'}
+          disabled=['X86_NATIVE_CPU','MZEN4','SCHED_BORE','SCHED_ALT','SCHED_BMQ','SCHED_CLASS_EXT',
+                    'PREEMPT_RT','PREEMPT_LAZY','NO_HZ_FULL','RUST','DEBUG_INFO_BTF',
+                    'LTO_CLANG_FULL','LTO_CLANG_THIN','AUTOFDO_CLANG','PROPELLER_CLANG',
+                    'CC_OPTIMIZE_FOR_SIZE','CC_OPTIMIZE_FOR_PERFORMANCE_O3','MODULE_SIG_FORCE','LOCALVERSION_AUTO']
+          errors=[]
+          for k,v in required.items():
+              if cfg.get('CONFIG_'+k)!=v: errors.append(f'{k}: expected {v}, found {cfg.get("CONFIG_"+k,"unset")}')
+          for k in disabled:
+              if cfg.get('CONFIG_'+k,'n')!='n': errors.append(k+' unexpectedly enabled')
+          for k in ['LOCALVERSION','CMDLINE','SYSTEM_TRUSTED_KEYS','SYSTEM_REVOCATION_KEYS']:
+              if cfg.get('CONFIG_'+k,'""')!='""': errors.append(k+' is not empty')
+          out=pathlib.Path('../dist/metadata/validation.txt')
+          out.write_text('\n'.join(errors)+'\n' if errors else 'Requested NUC7 settings passed; physical-device testing remains required.\n')
+          if errors: raise SystemExit('\n'.join(errors))
+          print(out.read_text())
+          PY
+          release=$(make -s CC=gcc HOSTCC=gcc kernelrelease)
+          [[ "$release" == "6.18."*"$LOCALVERSION" ]] || { echo '::error::Unexpected kernel release'; exit 1; }
+          (( ${#release} <= 64 )) || { echo '::error::Kernel release exceeds 64 characters'; exit 1; }
+          printf '%s\n' "$release" > ../dist/metadata/kernel-release.txt
+          echo "KERNEL_RELEASE=$release" >> "$GITHUB_ENV"
+          # Validate ISA selection translates to the expected compiler target.
+          make -s CC=gcc HOSTCC=gcc --eval='print-ci-flags:;@echo $(KBUILD_CFLAGS)' print-ci-flags > ../dist/metadata/compiler-flags.txt
+          python3 - <<'PY'
+          import pathlib,os,shlex
+          flags=shlex.split(pathlib.Path('../dist/metadata/compiler-flags.txt').read_text())
+          targets=[f for f in flags if f.startswith('-march=')]
+          expected='-march=x86-64-v3' if os.environ['NUC_ISA_LEVEL']=='3' else '-march=x86-64'
+          if not targets or targets[-1]!=expected: raise SystemExit('Unexpected compiler target: '+str(targets))
+          PY
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: cachyos-nuc7-${{ runner.os }}-${{ env.CACHY_COMMIT }}-${{ inputs.cpu_target }}-${{ hashFiles('dist/metadata/toolchain.txt', 'dist/metadata/final.config') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            cachyos-nuc7-${{ runner.os }}-${{ env.CACHY_COMMIT }}-${{ inputs.cpu_target }}-
+
+      - name: Set cache and build parallelism
+        env:
+          JOBS_INPUT: ${{ inputs.build_jobs }}
+        run: |
+          ccache --max-size=2G
+          ccache --zero-stats
+          python3 - <<'PY'
+          import os,pathlib
+          e=os.environ
+          available=int(next(l.split()[1] for l in pathlib.Path('/proc/meminfo').read_text().splitlines() if l.startswith('MemAvailable:')))
+          cpus=len(os.sched_getaffinity(0))
+          # Reserve ~2 GiB for other processes; allow ~1.5 GiB per compiler job.
+          memory_jobs=max(1,(available-2*1024*1024)//(1536*1024))
+          jobs=max(1,min(cpus,memory_jobs))
+          if e['JOBS_INPUT']!='auto': jobs=min(jobs,int(e['JOBS_INPUT']))
+          with open(e['GITHUB_ENV'],'a') as f: f.write('BUILD_JOBS='+str(jobs)+'\n')
+          pathlib.Path('dist/metadata/build-jobs.txt').write_text(str(jobs)+'\n')
+          print('Compiler jobs:',jobs)
+          PY
+
+      - name: Build kernel image and Debian packages
+        working-directory: kernel
+        timeout-minutes: 300
+        run: |
+          # GCC is reached through the ccache wrapper path. No SIMD/KCFLAGS hacks.
+          # bindeb-pkg creates image, matching headers, and ancillary packages.
+          make -j"$BUILD_JOBS" CC=gcc HOSTCC=gcc \
+            KDEB_PKGVERSION="${KERNEL_VERSION}-1+r${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
+            bindeb-pkg < /dev/null 2>&1 | tee ../dist/metadata/build.log
+
+      - name: Verify and collect installable packages
+        run: |
+          python3 - <<'PY'
+          import os,pathlib,subprocess,shutil,hashlib,json
+          p=pathlib.Path('dist'); release=os.environ['KERNEL_RELEASE']
+          expected={'linux-image-'+release,'linux-headers-'+release}
+          found=set(); rows=[]
+          for f in sorted(pathlib.Path('.').glob('*.deb')):
+              name=subprocess.check_output(['dpkg-deb','-f',str(f),'Package'],text=True).strip()
+              arch=subprocess.check_output(['dpkg-deb','-f',str(f),'Architecture'],text=True).strip()
+              version=subprocess.check_output(['dpkg-deb','-f',str(f),'Version'],text=True).strip()
+              rows.append({'file':f.name,'package':name,'architecture':arch,'version':version})
+              if name in expected:
+                  if arch!='amd64': raise SystemExit('Unexpected architecture: '+arch)
+                  if name in found: raise SystemExit('Duplicate package: '+name)
+                  subprocess.run(['dpkg-deb','--info',str(f)],check=True,stdout=subprocess.DEVNULL)
+                  shutil.copyfile(f,p/f.name); found.add(name)
+          (p/'metadata/packages.json').write_text(json.dumps(rows,indent=2)+'\n')
+          if found!=expected: raise SystemExit('Missing expected packages: '+str(expected-found))
+          (p/'SHA256SUMS').write_text(''.join(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+f.name+'\n' for f in sorted(p.glob('*.deb'))))
+          note=f'''NUC7 CachyOS source build: {release}
+          Only the verified image and matching headers are included.
+          On the NUC, extract into a separate folder and run:
+            sha256sum -c SHA256SUMS
+            sudo apt install ./*.deb
+          Resolve any DKMS errors. Check that the matching initramfs exists,
+          run sudo update-grub, and confirm both the new and previous kernels.
+          Keep the known-working Devuan/TKG kernel installed.
+          If Secure Boot is enabled, arrange kernel/module signing and enrollment
+          before attempting to boot this build. No enrollment is done by CI.
+          No new GRUB tuning is required; retain required existing boot options.
+          Diagnostics are in the separate build-records artifact.
+          '''
+          (p/'INSTALL.txt').write_text(note)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write('### NUC7 packages verified\n\nKernel: `'+release+'`\n\nDownload packages and build records.\n')
+          PY
+
+      - name: Collect diagnostics on success or failure
+        if: always()
+        run: |
+          mkdir -p dist/metadata
+          ccache --show-stats > dist/metadata/ccache.txt 2>&1 || true
+          df -h . > dist/metadata/disk.txt
+          if [ -f kernel/.config ]; then cp kernel/.config dist/metadata/final.config; fi
+
+      - name: Upload verified image and headers
+        uses: actions/upload-artifact@v4
+        with:
+          name: cachyos-nuc7-packages-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/*.deb
+            dist/SHA256SUMS
+            dist/INSTALL.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build records even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cachyos-nuc7-records-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/metadata/
+          if-no-files-found: warn
+          retention-days: 30
