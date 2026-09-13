@@ -1,3 +1,5 @@
+# Revision 2: allow compiled intel_pstate support; require ACPI cpufreq for E6410.
+# Compiled driver availability does not mean it binds to unsupported hardware.
 # Upload to .github/workflows/build-cachyos-e6410.yml on your default branch.
 # REQUIRED: configs/e6410.config exported from a working kernel ON THE E6410:
 #   cp "/boot/config-$(uname -r)" "$HOME/e6410.config"
@@ -174,7 +176,7 @@ jobs:
             'CPU_FREQ':'y','CPU_FREQ_DEFAULT_GOV_SCHEDUTIL':'y',
             'CPU_FREQ_DEFAULT_GOV_PERFORMANCE':'n','CPU_FREQ_DEFAULT_GOV_ONDEMAND':'n',
             'CPU_FREQ_DEFAULT_GOV_USERSPACE':'n','CPU_FREQ_DEFAULT_GOV_POWERSAVE':'n','CPU_FREQ_DEFAULT_GOV_CONSERVATIVE':'n',
-            'X86_INTEL_PSTATE':'n','X86_ACPI_CPUFREQ':'y','CPU_FREQ_GOV_SCHEDUTIL':'y',
+            'X86_INTEL_PSTATE':'y','ACPI_PROCESSOR':'y','X86_ACPI_CPUFREQ':'y','CPU_FREQ_GOV_SCHEDUTIL':'y',
             'MODULES':'y','BLK_DEV_INITRD':'y','DEVTMPFS':'y','DEVTMPFS_MOUNT':'y',
             'EFI':'y','EFI_STUB':'y','EFI_PARTITION':'y',
             'PCI':'y','ACPI':'y','DRM':'y','DRM_I915':'m',
@@ -213,12 +215,12 @@ jobs:
                     'X86_64_VERSION':e['TARGET_ISA_LEVEL'],'CACHY':'y',
                     'CC_OPTIMIZE_FOR_PERFORMANCE':'y','PREEMPT':'y','PREEMPT_DYNAMIC':'y',
                     'NO_HZ_IDLE':'y','HZ':e['TARGET_TIMER_HZ'],
-                    'X86_ACPI_CPUFREQ':'y','CPU_FREQ_DEFAULT_GOV_SCHEDUTIL':'y',
+                    'ACPI_PROCESSOR':'y','X86_ACPI_CPUFREQ':'y','CPU_FREQ_DEFAULT_GOV_SCHEDUTIL':'y',
                     'MODULES':'y','BLK_DEV_INITRD':'y','DEVTMPFS':'y',
                     'EFI':'y','EFI_STUB':'y','DRM_I915':'m',
                     'SATA_AHCI':'m','BLK_DEV_NVME':'m','EXT4_FS':'m','DEBUG_INFO_NONE':'y',
                     'SWAP':'y','ZSWAP':'y','ZSMALLOC':'y','CRYPTO_ZSTD':'y','CRYPTO_LZ4':'y'}
-          disabled=['X86_INTEL_PSTATE','X86_NATIVE_CPU','MZEN4','SCHED_BORE','SCHED_ALT','SCHED_BMQ','SCHED_CLASS_EXT',
+          disabled=['X86_NATIVE_CPU','MZEN4','SCHED_BORE','SCHED_ALT','SCHED_BMQ','SCHED_CLASS_EXT',
                     'PREEMPT_RT','PREEMPT_LAZY','NO_HZ_FULL','RUST','DEBUG_INFO_BTF',
                     'LTO_CLANG_FULL','LTO_CLANG_THIN','AUTOFDO_CLANG','PROPELLER_CLANG',
                     'CC_OPTIMIZE_FOR_SIZE','CC_OPTIMIZE_FOR_PERFORMANCE_O3','MODULE_SIG_FORCE','LOCALVERSION_AUTO']
