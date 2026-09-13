@@ -1,415 +1,320 @@
-name: Build linux-tkg (Debian/Devuan)
-
-# ---------------------------------------------------------------------------
-# NOTE: workflow_dispatch allows a maximum of 10 inputs. This file uses all 10.
-# To add another knob, either fold it into an existing choice list (as was done
-# with PREEMPT_RT, now part of "cpu_scheduler") or pass it through "extra_cfg".
-# ---------------------------------------------------------------------------
-
-on:
+# Revision 2: read tkg-reference.html for required target configurations.
+# Reviewed upstream pin; full compilation and hardware testing still required.
+name: Build linux-tkg (Devuan device profiles)
+'on':
   workflow_dispatch:
     inputs:
+      machine:
+        description: Device profile; requires configs/<machine>.config in this repository
+        required: true
+        type: choice
+        default: nuc7
+        options:
+        - nuc7
+        - z220
+        - e6410
       kernel_version:
-        description: "Kernel version (e.g. 6.13-latest, or a tag like v6.12.8)"
+        description: 'profile, exact tag (v6.18.51), or series (6.18-latest). Supported: 6.18 / 7.2'
         required: true
-        default: "7.2-latest"
+        default: profile
       cpu_scheduler:
-        description: "CPU scheduler. 'cfs' and 'cfs + PREEMPT_RT' only work on kernels 6.5 and older; 6.6+ must use eevdf/bore/pds/bmq"
+        description: BORE baseline; EEVDF comparison. RT requires EEVDF.
         required: true
         type: choice
-        default: "eevdf"
+        default: bore
         options:
-          - eevdf              # kernel default on 6.6+
-          - bore
-          - pds
-          - bmq
-          - cfs                # 6.5 and older only
-          - "cfs + PREEMPT_RT" # 6.5 and older only - RT requires cfs
+        - bore
+        - eevdf
+      preemption:
+        description: Full desktop preemption, or experimental real-time
+        required: true
+        type: choice
+        default: full
+        options:
+        - full
+        - rt
       compiler:
-        description: "Compiler"
+        description: GCC baseline; LLVM comparison without LTO
         required: true
         type: choice
-        default: "gcc"
+        default: gcc
         options:
-          - gcc
-          - llvm
+        - gcc
+        - llvm
       opt_level:
-        description: "Compiler optimization"
+        description: 1 = O2; 2 = O3; 3 = Os
         required: true
         type: choice
-        default: "1"
+        default: '1'
         options:
-          - "1"   # -O2, performance (kernel default)
-          - "2"   # -O3, optimize harder
-          - "3"   # -Os, optimize for size
+        - '1'
+        - '2'
+        - '3'
       timer_freq:
-        description: "Timer frequency (Hz)"
+        description: 'profile: NUC 500, Z220 500, E6410 300 Hz'
         required: true
         type: choice
-        default: "1000"
+        default: profile
         options:
-          - "100"
-          - "250"
-          - "300"
-          - "500"
-          - "750"
-          - "1000"
+        - profile
+        - '250'
+        - '300'
+        - '500'
+        - '1000'
       cpu_governor:
-        description: "Default CPU governor"
+        description: Default generic governor; NUC active intel_pstate uses its own algorithms
         required: true
         type: choice
-        default: "schedutil"
+        default: schedutil
         options:
-          - schedutil
-          - ondemand
-          - performance
-      module_trimming:
-        description: "Trim unused kernel modules for faster builds. 'modprobed-db' needs modprobed.db committed at the repo root (see README); 'diet' uses linux-tkg's built-in common-modules list, no setup needed"
-        required: true
-        type: choice
-        default: "none"
-        options:
-          - none
-          - modprobed-db
-          - diet
+        - schedutil
+        - ondemand
+        - performance
       cpu_arch:
-        description: "Target CPU microarchitecture, passed to -march (pick 'x86-64' or a 'v2/v3/v4' level if this kernel needs to run on multiple different machines - specific CPU names pin it to that one CPU family, and 'native' targets the GitHub runner's CPU, not yours)"
+        description: profile, or explicit compatible target; never targets the runner
         required: true
         type: choice
-        default: "x86-64"
+        default: profile
         options:
-          - x86-64         # safest - runs on any x86_64 CPU
-          - x86-64-v2      # baseline for CPUs newer than ~2008
-          - westmere       # Intel Core 1st gen (Arrandale/Clarkdale)
-          - sandybridge    # Intel Core 2nd gen
-          - ivybridge      # Intel Core 3rd gen
-          - x86-64-v3      # baseline for CPUs newer than ~2013
-          - x86-64-v4      # Intel Skylake-X+ / AMD Zen4+
-          - alderlake      # Intel Core 12th gen
-          - raptorlake     # Intel Core 13th/14th gen (needs GCC 13+)
-          - meteorlake     # Intel Core Ultra 100 (needs GCC 13+)
-          - tigerlake      # Intel Core 11th gen (laptop)
-          - rocketlake     # Intel Core 11th gen (desktop)
-          - icelake-client # Intel Core 10th gen
-          - skylake        # Intel Core 6th-9th gen
-          - znver1         # AMD Ryzen 1000/2000, EPYC 7001
-          - znver2         # AMD Ryzen 3000/4000, EPYC 7002
-          - znver3         # AMD Ryzen 5000/6000, EPYC 7003
-          - znver4         # AMD Ryzen 7000/8000, EPYC 9004
-          - native         # tunes for the GH Actions runner's CPU (usually not what you want)
-      kernel_localversion:
-        description: "Custom kernel localversion tag (optional, e.g. 'devuan')"
+        - profile
+        - x86-64
+        - westmere
+        - sandybridge
+        - ivybridge
+        - skylake
+      nr_cpus:
+        description: 'Maximum logical CPUs; profile: 4 / 8 / 4. Check actual hardware.'
+        required: true
+        type: choice
+        default: profile
+        options:
+        - profile
+        - '4'
+        - '8'
+      module_trimming:
+        description: Optional per-device modules/<machine>.db; keep none for initial builds
+        required: true
+        type: choice
+        default: none
+        options:
+        - none
+        - modprobed-db
+      build_label:
+        description: Optional lowercase label, max 8 characters, e.g. test1. Run ID is appended.
         required: false
-        default: ""
-      extra_cfg:
-        description: "Advanced: extra linux-tkg config overrides, semicolon-separated (e.g. _debugdisable=\"true\"; _numadisable=\"true\"). Applied last, wins over everything above."
-        required: false
-        default: ""
-
+        default: ''
 permissions:
   contents: read
-
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.machine }}
   cancel-in-progress: false
-
 defaults:
   run:
-    # GitHub's default is 'bash -e' with no pipefail, which hides failures
-    # in the middle of a pipeline.
     shell: bash -euo pipefail {0}
-
 env:
-  # Pin linux-tkg so upstream changes can't silently alter the resulting
-  # kernel (or introduce a new unset option that stalls the build on a
-  # prompt). Accepts a commit SHA, tag, or branch name. Bump deliberately.
-  TKG_REF: "master"
-  TKG_REPO: "https://github.com/Frogging-Family/linux-tkg.git"
-
+  TKG_REF: 7e98360cfadd8d7f6da829da07ce11bd4646e006
+  TKG_REPO: https://github.com/Frogging-Family/linux-tkg.git
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 jobs:
   build:
-    # Pinned rather than ubuntu-latest: the runner image determines the GCC
-    # version, which determines which -march values are accepted.
     runs-on: ubuntu-24.04
-    timeout-minutes: 350   # stay under GH Actions' 6h hard job limit
-
+    timeout-minutes: 350
     steps:
-      - name: Checkout this repo (for modprobed.db, if used)
-        uses: actions/checkout@v4
-
-      - name: Validate inputs
-        env:
-          CPU_SCHEDULER: ${{ inputs.cpu_scheduler }}
-          MODULE_TRIMMING: ${{ inputs.module_trimming }}
-        run: |
-          if [ "$MODULE_TRIMMING" = "modprobed-db" ] && [ ! -f "$GITHUB_WORKSPACE/modprobed.db" ]; then
-            echo "::error::module_trimming was set to 'modprobed-db' but modprobed.db was not found at the repo root. Commit it first, or choose 'diet'/'none' instead."
-            exit 1
-          fi
-
-          case "$CPU_SCHEDULER" in
-            cfs|"cfs + PREEMPT_RT")
-              echo "::warning::'$CPU_SCHEDULER' is only available on kernels 6.5 and older. On 6.6+ the build will fail - use eevdf, bore, pds or bmq."
-              ;;
-          esac
-
-      - name: Free up disk space
-        run: |
-          # A full-module kernel build plus the kernel git clone can approach
-          # 30 GB; the stock runner only has ~25 GB free.
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/share/swift \
-            /usr/local/lib/android \
-            /usr/local/.ghcup \
-            /opt/ghc \
-            /opt/hostedtoolcache \
-            2>/dev/null || true
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-          df -h /
-
-      - name: Clone linux-tkg at pinned ref
-        run: |
-          # 'git init + fetch' rather than 'clone --branch' so TKG_REF can be
-          # a commit SHA as well as a tag or branch.
-          git init -q linux-tkg
-          cd linux-tkg
-          git remote add origin "$TKG_REPO"
-          git fetch -q --depth 1 origin "$TKG_REF"
-          git checkout -q FETCH_HEAD
-          echo "Building with linux-tkg commit:"
-          git log -1 --format="%H  (%ci)  %s"
-
-      - name: Write override config
-        # install.sh automatically sources ~/.config/frogminer/linux-tkg.cfg
-        # and lets its values override customization.cfg - no need to edit
-        # the repo's own files.
-        #
-        # Inputs are passed via env rather than interpolated into the script
-        # body, so a hostile input value can't break out into the shell. The
-        # heredoc is unquoted so shell variables expand, but expansion results
-        # are not re-expanded, so no command substitution survives.
-        env:
-          KERNEL_VERSION: ${{ inputs.kernel_version }}
-          CPU_SCHEDULER: ${{ inputs.cpu_scheduler }}
-          COMPILER: ${{ inputs.compiler }}
-          OPT_LEVEL: ${{ inputs.opt_level }}
-          TIMER_FREQ: ${{ inputs.timer_freq }}
-          CPU_GOVERNOR: ${{ inputs.cpu_governor }}
-          MODULE_TRIMMING: ${{ inputs.module_trimming }}
-          CPU_ARCH: ${{ inputs.cpu_arch }}
-          LOCALVERSION: ${{ inputs.kernel_localversion }}
-          EXTRA_CFG: ${{ inputs.extra_cfg }}
-        run: |
-          mkdir -p ~/.config/frogminer
-
-          # PREEMPT_RT is in linux-tkg's "prompt if empty" block. An empty
-          # value makes install.sh stop and wait for input forever, so the
-          # "off" value must be an explicit "0", not "".
-          sched="$CPU_SCHEDULER"
-          rt_value="0"
-          if [ "$sched" = "cfs + PREEMPT_RT" ]; then
-            sched="cfs"
-            rt_value="1"
-          fi
-
-          modprobeddb_value="false"
-          kernel_on_diet_value="false"
-          case "$MODULE_TRIMMING" in
-            modprobed-db) modprobeddb_value="true" ;;
-            diet)         kernel_on_diet_value="true" ;;
-          esac
-
-          localversion_sanitized=$(printf '%s' "$LOCALVERSION" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed -e 's/[^a-z0-9+.-]/-/g' -e 's/^-*//' -e 's/-*$//')
-
-          cat > ~/.config/frogminer/linux-tkg.cfg <<EOF
-          ##### What we actually want to build #####
-          _distro="Debian"
-          _version="${KERNEL_VERSION}"
-          _cpusched="${sched}"
-          _compiler="${COMPILER}"
-          _compileroptlevel="${OPT_LEVEL}"
-          _processor_opt="${CPU_ARCH}"
-          _timer_freq="${TIMER_FREQ}"
-          _default_cpu_gov="${CPU_GOVERNOR}"
-          _kernel_localversion="${localversion_sanitized}"
-
-          ##### PREEMPT_RT #####
-          _preempt_rt="${rt_value}"
-          _preempt_rt_force="0"
-
-          ##### Module trimming #####
-          _modprobeddb="${modprobeddb_value}"
-          _modprobeddb_db_path="$GITHUB_WORKSPACE/modprobed.db"
-          _kernel_on_diet="${kernel_on_diet_value}"
-
-          ##### Scheduler tunables #####
-          _sched_yield_type="1"
-          _rr_interval="default"
-          _bore_min_base_slice_ns="2000000"
-          _smt_nice="true"
-          _tickless="2"
-
-          ##### Non-interactive / CI requirements #####
-          # Every option linux-tkg prompts for when left empty must be set here,
-          # or install.sh will block until the job times out.
-          _install_after_building="no"
-          _logging_use_script="no"
-          _menunconfig="false"
-          _diffconfig="false"
-          _user_patches="false"
-          _user_patches_no_confirm="false"
-          _config_fragments="false"
-          _config_fragments_no_confirm="false"
-          _community_patches=""
-          _configfile=""
-          _config_updating="olddefconfig"
-          _offline=""
-          _force_all_threads="true"
-          _noccache="false"
-
-          ##### Upstream defaults, pinned explicitly #####
-          # These all have non-empty defaults in customization.cfg. They are
-          # restated here so an upstream default change does not silently move
-          # them underneath us. Edit freely.
-          _glitched_base="true"
-          _zenify="true"
-          _misc_adds="true"
-          _clear_patches="true"
-          _openrgb="true"
-          _mglru="true"
-          _ntsync="false"
-          _aggressive_ondemand="true"
-          _random_trust_cpu="true"
-          _acs_override="false"
-          _ftracedisable="false"
-          _numadisable="false"
-          _debugdisable="false"
-          _STRIP="true"
-          _NR_CPUS_value=""
-          _tcp_cong_alg=""
-          # Upstream's default kernel command line. Note intel_pstate=passive,
-          # which hands frequency scaling to the governor instead of the
-          # hardware - drop it if you want Intel HWP driving P-states.
-          _custom_commandline="intel_pstate=passive split_lock_detect=off"
-
-          ##### LLVM #####
-          _lto_mode="no"
-          _llvm_ias="1"
-          _libunwind_replace="false"
-
-          ##### Extra compiler flags #####
-          KCFLAGS=""
-          KCPPFLAGS=""
-          KRUSTFLAGS=""
-          EOF
-
-          # User-supplied overrides go last so they win.
-          if [ -n "$EXTRA_CFG" ]; then
-            {
-              echo ""
-              echo "##### extra_cfg input #####"
-              printf '%s\n' "$EXTRA_CFG" | tr ';' '\n' | sed 's/^[[:space:]]*//'
-            } >> ~/.config/frogminer/linux-tkg.cfg
-          fi
-
-          echo "---- Effective override config ----"
-          cat ~/.config/frogminer/linux-tkg.cfg
-
-      - name: Set up ccache
-        env:
-          COMPILER: ${{ inputs.compiler }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ccache
-
-          # ccache 4.x defaults to ~/.cache/ccache (XDG), not ~/.ccache.
-          # Pin it so the cache step below actually caches something.
-          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
-          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
-
-          if [ "$COMPILER" = "llvm" ]; then
-            # /usr/lib/ccache only gets symlinks for compilers already present
-            # when ccache is configured. install.sh pulls clang in later, so
-            # without this the LLVM path silently bypasses ccache entirely.
-            sudo apt-get install -y clang lld llvm
-            sudo /usr/sbin/update-ccache-symlinks || true
-          fi
-
-          CCACHE_DIR="$HOME/.ccache" ccache --max-size=2G
-          CCACHE_DIR="$HOME/.ccache" ccache --zero-stats
-
-      - name: Cache ccache directory
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          # run_id makes the primary key unique per run. Without it, the exact
-          # key always hits on the second run and the cache is never refreshed
-          # with newly compiled objects.
-          key: tkg-ccache-${{ inputs.kernel_version }}-${{ inputs.cpu_scheduler }}-${{ inputs.compiler }}-${{ inputs.cpu_arch }}-${{ github.run_id }}
-          restore-keys: |
-            tkg-ccache-${{ inputs.kernel_version }}-${{ inputs.cpu_scheduler }}-${{ inputs.compiler }}-${{ inputs.cpu_arch }}-
-            tkg-ccache-${{ inputs.kernel_version }}-${{ inputs.cpu_scheduler }}-${{ inputs.compiler }}-
-            tkg-ccache-${{ inputs.kernel_version }}-
-            tkg-ccache-
-
-      - name: Build kernel (.deb packages)
-        working-directory: linux-tkg
-        run: |
-          # install.sh installs its own apt dependency list, then clones the
-          # kernel source, patches it, configures it, and runs 'make bindeb-pkg'.
-          #
-          # </dev/null is deliberate: if a future upstream option is left unset,
-          # install.sh asks a question. Without this it would hang until the
-          # 350-minute timeout; with it, the build fails immediately and loudly.
-          ./install.sh install < /dev/null
-
-      - name: ccache statistics
-        if: always()
-        run: ccache --show-stats || true
-
-      - name: Collect built packages
-        id: collect
-        env:
-          KERNEL_VERSION: ${{ inputs.kernel_version }}
-          CPU_SCHEDULER: ${{ inputs.cpu_scheduler }}
-          CPU_ARCH: ${{ inputs.cpu_arch }}
-        run: |
-          mkdir -p dist
-          # Searched broadly rather than assuming linux-tkg/DEBS: if upstream
-          # moves the output directory, a narrow find prints nothing and exits
-          # 0, and the failure only surfaces at the upload step.
-          mapfile -t debs < <(find linux-tkg -maxdepth 3 -iname "*.deb" -print)
-
-          if [ "${#debs[@]}" -eq 0 ]; then
-            echo "::error::Build finished but no .deb packages were found."
-            exit 1
-          fi
-
-          printf '%s\n' "${debs[@]}"
-          cp "${debs[@]}" dist/
-
-          # Artifact names reject : " < > | * ? \r \n, and kernel_version is a
-          # freeform input, so sanitize before using it as a name.
-          slug=$(printf '%s-%s-%s' "$KERNEL_VERSION" "$CPU_SCHEDULER" "$CPU_ARCH" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed -e 's/[^a-z0-9._-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-*//' -e 's/-*$//')
-          echo "slug=$slug" >> "$GITHUB_OUTPUT"
-
-          {
-            echo "### Built packages"
-            echo ""
-            echo '```'
-            (cd dist && ls -lh *.deb)
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload .deb artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-tkg-debs-${{ steps.collect.outputs.slug }}
-          path: dist/*.deb
-          if-no-files-found: error
-          retention-days: 14
+    - name: Checkout private repository
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Resolve profile and validate inputs
+      env:
+        MACHINE: ${{ inputs.machine }}
+        KERNEL_VERSION: ${{ inputs.kernel_version }}
+        CPU_SCHEDULER: ${{ inputs.cpu_scheduler }}
+        PREEMPTION: ${{ inputs.preemption }}
+        COMPILER: ${{ inputs.compiler }}
+        OPT_LEVEL: ${{ inputs.opt_level }}
+        TIMER_FREQ: ${{ inputs.timer_freq }}
+        CPU_GOVERNOR: ${{ inputs.cpu_governor }}
+        CPU_ARCH: ${{ inputs.cpu_arch }}
+        NR_CPUS: ${{ inputs.nr_cpus }}
+        MODULE_TRIMMING: ${{ inputs.module_trimming }}
+        BUILD_LABEL: ${{ inputs.build_label }}
+      run: |
+        python3 - <<'PYCODE'
+        import os,re,json,pathlib
+        p=pathlib.Path(os.environ['GITHUB_WORKSPACE']); e=os.environ
+        profiles={'nuc7':('v7.2.5','skylake','500','4'),'z220':('v6.18.51','ivybridge','500','8'),'e6410':('v6.18.51','westmere','300','4')}
+        m=e['MACHINE']; assert m in profiles, 'Unknown machine'
+        v,a,h,n=profiles[m]
+        for name,allowed in {'CPU_SCHEDULER':['bore','eevdf'],'PREEMPTION':['full','rt'],'COMPILER':['gcc','llvm'],'OPT_LEVEL':['1','2','3'],'CPU_GOVERNOR':['schedutil','ondemand','performance'],'MODULE_TRIMMING':['none','modprobed-db']}.items():
+            assert e[name] in allowed, 'Invalid '+name
+        v=v if e['KERNEL_VERSION']=='profile' else e['KERNEL_VERSION']
+        assert re.fullmatch(r'(?:v?(?:6\.18|7\.2)\.[0-9]+|(?:6\.18|7\.2)-latest)',v), 'Use a supported stable tag or series'
+        if not v.endswith('-latest') and not v.startswith('v'): v='v'+v
+        a=a if e['CPU_ARCH']=='profile' else e['CPU_ARCH']; assert a in ['x86-64','westmere','sandybridge','ivybridge','skylake']
+        h=h if e['TIMER_FREQ']=='profile' else e['TIMER_FREQ']; assert h in ['250','300','500','1000']
+        n=n if e['NR_CPUS']=='profile' else e['NR_CPUS']; assert n in ['4','8']
+        assert e['PREEMPTION']!='rt' or e['CPU_SCHEDULER']=='eevdf', 'RT requires EEVDF'
+        label=e['BUILD_LABEL']; assert re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,7}',label) or not label, 'Invalid build_label'
+        c=p/'configs'/f'{m}.config'; assert c.is_file(), f'Missing {c}: export the target Devuan /boot/config-<version>; see guide'
+        s=c.read_text(); assert 'CONFIG_X86_64=y' in s and 'CONFIG_MODULES=y' in s, 'Expected an x86-64 modular kernel baseline'
+        if e['MODULE_TRIMMING']=='modprobed-db':
+            db=p/'modules'/f'{m}.db'; assert db.is_file() and db.stat().st_size, f'Missing or empty {db}'
+        suffix=f"{m}-{e['CPU_SCHEDULER']}-{e['PREEMPTION']}"+(('-'+label) if label else '')+f"-r{e['GITHUB_RUN_ID']}a{e['GITHUB_RUN_ATTEMPT']}"
+        resolved={'MACHINE':m,'VERSION':v,'ARCH':a,'HZ':h,'NR':n,'SCHEDULER':e['CPU_SCHEDULER'],'PREEMPTION':e['PREEMPTION'],'COMPILER':e['COMPILER'],'OPT':e['OPT_LEVEL'],'GOVERNOR':e['CPU_GOVERNOR'],'TRIMMING':e['MODULE_TRIMMING'],'SUFFIX':suffix}
+        (p/'dist/metadata').mkdir(parents=True,exist_ok=True)
+        (p/'dist/metadata/profile.json').write_text(json.dumps(resolved,indent=2)+'\n')
+        with open(e['GITHUB_ENV'],'a') as f:
+            for k,val in resolved.items(): f.write('BUILD_'+k+'='+val+'\n')
+        print(json.dumps(resolved,indent=2))
+        PYCODE
+    - name: Free up disk space
+      run: |
+        # A full-module kernel build plus the kernel git clone can approach
+        # 30 GB; the stock runner only has ~25 GB free.
+        sudo rm -rf \
+          /usr/share/dotnet \
+          /usr/share/swift \
+          /usr/local/lib/android \
+          /usr/local/.ghcup \
+          /opt/ghc \
+          /opt/hostedtoolcache \
+          2>/dev/null || true
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
+        df -h /
+    - name: Clone reviewed upstream commit
+      run: |
+        [[ "$TKG_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'TKG_REF must be a full commit SHA'; exit 1; }
+        git init -q linux-tkg
+        git -C linux-tkg remote add origin "$TKG_REPO"
+        git -C linux-tkg fetch -q --depth 1 origin "$TKG_REF"
+        git -C linux-tkg checkout -q FETCH_HEAD
+        [[ "$(git -C linux-tkg rev-parse HEAD)" = "$TKG_REF" ]]
+        git -C linux-tkg log -1 --format=fuller > dist/metadata/tkg-commit.txt
+    - name: Write safely quoted TKG settings and fragments
+      run: |
+        python3 - <<'PYCODE'
+        import pathlib,os,shlex,json,shutil
+        p=pathlib.Path(os.environ['GITHUB_WORKSPACE']); e=os.environ; t=p/'linux-tkg'
+        cfg={'_distro': 'Debian', '_preempt_rt_force': '0', '_sched_yield_type': '1', '_rr_interval': 'default', '_bore_min_base_slice_ns': '2000000', '_smt_nice': 'true', '_tickless': '2', '_install_after_building': 'no', '_logging_use_script': 'no', '_menunconfig': 'false', '_diffconfig': 'false', '_user_patches': 'false', '_user_patches_no_confirm': 'false', '_config_fragments': 'true', '_config_fragments_no_confirm': 'true', '_community_patches': '', '_configfile': 'ci-base.config', '_config_updating': 'olddefconfig', '_offline': '', '_force_all_threads': 'true', '_noccache': 'false', '_glitched_base': 'true', '_zenify': 'true', '_misc_adds': 'true', '_clear_patches': 'true', '_openrgb': 'false', '_mglru': 'true', '_ntsync': 'false', '_aggressive_ondemand': 'true', '_random_trust_cpu': 'true', '_acs_override': 'false', '_ftracedisable': 'false', '_numadisable': 'false', '_debugdisable': 'false', '_STRIP': 'true', '_NR_CPUS_value': '', '_tcp_cong_alg': '', '_custom_commandline': '', '_lto_mode': 'no', '_llvm_ias': '1', '_libunwind_replace': 'false', 'KCFLAGS': '', 'KCPPFLAGS': '', 'KRUSTFLAGS': '', '_nofallback': 'true', '_kernel_on_diet': 'false'}
+        cfg.update(_version=e['BUILD_VERSION'],_cpusched=e['BUILD_SCHEDULER'],_compiler=e['BUILD_COMPILER'],_compileroptlevel=e['BUILD_OPT'],_processor_opt=e['BUILD_ARCH'],_timer_freq=e['BUILD_HZ'],_default_cpu_gov=e['BUILD_GOVERNOR'],_kernel_localversion=e['BUILD_SUFFIX'],_NR_CPUS_value=e['BUILD_NR'],_preempt_rt='1' if e['BUILD_PREEMPTION']=='rt' else '0',_modprobeddb='true' if e['BUILD_TRIMMING']=='modprobed-db' else 'false',_modprobeddb_db_path=str(p/'modules'/ (e['BUILD_MACHINE']+'.db')))
+        shutil.copyfile(p/'configs'/(e['BUILD_MACHINE']+'.config'),t/'ci-base.config')
+        # Device fragments contain Kconfig assignments, not executable shell overrides.
+        f=p/'configs'/(e['BUILD_MACHINE']+'.myfrag')
+        if f.is_file(): shutil.copyfile(f,t/'10-device.myfrag')
+        common=['CONFIG_LOCALVERSION=""','# CONFIG_LOCALVERSION_AUTO is not set','CONFIG_SYSTEM_TRUSTED_KEYS=""','CONFIG_SYSTEM_REVOCATION_KEYS=""','CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"','# CONFIG_MODULE_SIG_FORCE is not set','CONFIG_CMDLINE=""','# CONFIG_CMDLINE_BOOL is not set','# CONFIG_CMDLINE_OVERRIDE is not set','CONFIG_BLK_DEV_INITRD=y','CONFIG_DEVTMPFS=y','CONFIG_DEVTMPFS_MOUNT=y','CONFIG_EFI_PARTITION=y','CONFIG_SMP=y','CONFIG_MODULES=y','CONFIG_PSI=y','CONFIG_PSI_DEFAULT_DISABLED=n','CONFIG_NO_HZ_IDLE=y','# CONFIG_NO_HZ_FULL is not set','# CONFIG_PREEMPT_NONE is not set','# CONFIG_PREEMPT_VOLUNTARY is not set']
+        common+=['CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE='+('y' if e['BUILD_OPT']=='1' else 'n'),'CONFIG_CC_OPTIMIZE_FOR_SIZE='+('y' if e['BUILD_OPT']=='3' else 'n')]
+        if e['BUILD_PREEMPTION']=='rt': common+=['CONFIG_EXPERT=y','CONFIG_PREEMPT_RT=y','# CONFIG_PREEMPT is not set','# CONFIG_PREEMPT_DYNAMIC is not set']
+        else: common+=['CONFIG_PREEMPT=y','CONFIG_PREEMPT_DYNAMIC=y','# CONFIG_PREEMPT_RT is not set']
+        if e['BUILD_MACHINE']=='e6410': common+=['CONFIG_SWAP=y','CONFIG_ZSWAP=y','CONFIG_ZSMALLOC=y','CONFIG_CRYPTO_ZSTD=y','CONFIG_CRYPTO_LZ4=y']
+        (t/'99-ci.myfrag').write_text('\n'.join(common)+'\n')
+        f=pathlib.Path.home()/'.config/frogminer/linux-tkg.cfg'; f.parent.mkdir(parents=True,exist_ok=True)
+        f.write_text('# Generated; values are shell-quoted.\n'+''.join(k+'='+shlex.quote(v)+'\n' for k,v in cfg.items()))
+        shutil.copyfile(f,p/'dist/metadata/overrides.cfg')
+        shutil.copyfile(t/'ci-base.config',p/'dist/metadata/base.config')
+        for f in t.glob('*.myfrag'): shutil.copyfile(f,p/'dist/metadata'/f.name)
+        PYCODE
+    - name: Restore compiler cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: tkg-${{ runner.os }}-${{ inputs.machine }}-${{ env.TKG_REF }}-${{ env.BUILD_COMPILER }}-${{ env.BUILD_ARCH
+          }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          tkg-${{ runner.os }}-${{ inputs.machine }}-${{ env.TKG_REF }}-${{ env.BUILD_COMPILER }}-${{ env.BUILD_ARCH }}-
+    - name: Install and configure compiler cache
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ccache gcc g++ binutils
+        if [ "$BUILD_COMPILER" = llvm ]; then sudo apt-get install -y clang lld llvm; fi
+        sudo /usr/sbin/update-ccache-symlinks
+        printf '%s
+        ' /usr/lib/ccache >> "$GITHUB_PATH"
+        ccache --max-size=2G
+        ccache --zero-stats
+        { gcc --version; ld --version; ccache --version; if [ "$BUILD_COMPILER" = llvm ]; then clang --version; ld.lld --version; fi; } > dist/metadata/toolchain.txt
+        printf '%s
+        ' "${ImageOS:-unknown} ${ImageVersion:-unknown}" > dist/metadata/runner.txt
+    - name: Install checked pre-build validation hook
+      run: |
+        cat > "$GITHUB_WORKSPACE/verify-config.py" <<'PYCODE'
+        import os,pathlib,re,json,shutil,subprocess,sys
+        p=pathlib.Path(os.environ['GITHUB_WORKSPACE']); out=p/'dist/metadata'; e=os.environ
+        s=pathlib.Path('.config').read_text(); c=dict(re.findall(r'^(CONFIG_\w+)=(.*)$',s,re.M))
+        shutil.copyfile('.config',out/'final.config')
+        (out/'kernel-source-commit.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True))
+        release=subprocess.check_output(['make','-s','kernelrelease','LOCALVERSION=-'+sys.argv[1]]+(['LLVM=1','LLVM_IAS=1'] if e['BUILD_COMPILER']=='llvm' else []),text=True).strip()
+        (out/'kernel-release.txt').write_text(release+'\n')
+        assert len(release)<=64, 'Kernel release exceeds 64 characters'
+        checks={'CONFIG_X86_64':'y','CONFIG_SMP':'y','CONFIG_MODULES':'y','CONFIG_BLK_DEV_INITRD':'y','CONFIG_DEVTMPFS':'y','CONFIG_NO_HZ_IDLE':'y','CONFIG_NR_CPUS':e['BUILD_NR'],'CONFIG_HZ':e['BUILD_HZ'],'CONFIG_CPU_FREQ_DEFAULT_GOV_'+e['BUILD_GOVERNOR'].upper():'y'}
+        checks['CONFIG_PREEMPT_RT' if e['BUILD_PREEMPTION']=='rt' else 'CONFIG_PREEMPT']='y'
+        opt={'1':'CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE','2':'CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3','3':'CONFIG_CC_OPTIMIZE_FOR_SIZE'}[e['BUILD_OPT']]; checks[opt]='y'
+        if e['BUILD_SCHEDULER']=='bore': checks['CONFIG_SCHED_BORE']='y'
+        else: assert c.get('CONFIG_SCHED_BORE','n')=='n', 'Unexpected BORE'
+        if e['BUILD_MACHINE']=='e6410': checks.update(CONFIG_SWAP='y',CONFIG_ZSWAP='y',CONFIG_ZSMALLOC='y')
+        errors=[f'{k}: expected {v}, got {c.get(k,"unset")}' for k,v in checks.items() if c.get(k)!=v]
+        if c.get('CONFIG_CMDLINE','""')!='""': errors.append('Unexpected built-in command line')
+        if e['BUILD_PREEMPTION']=='full' and c.get('CONFIG_PREEMPT_RT','n')!='n': errors.append('Unexpected RT')
+        mk=pathlib.Path('Makefile').read_text()
+        if not re.search(r'^KBUILD_CFLAGS \+= -march='+re.escape(e['BUILD_ARCH'])+r'$',mk,re.M): errors.append('Requested -march missing')
+        (out/'validation.txt').write_text('\n'.join(errors) if errors else 'Requested configuration checks passed. Hardware testing still required.\n')
+        assert not errors, '\n'.join(errors)
+        print('Pre-build checks passed:',release)
+        PYCODE
+        python3 - <<'PYCODE'
+        from pathlib import Path
+        p=Path('linux-tkg/install.sh'); s=p.read_text()
+        needle='    time make ${llvm_opt} -j ${_thread_num} bindeb-pkg LOCALVERSION=-${_kernel_flavor}'
+        assert s.count(needle)==1, 'Upstream build hook changed; review before updating pin'
+        s=s.replace(needle,'    python3 "$GITHUB_WORKSPACE/verify-config.py" "$_kernel_flavor" || exit 1\n'+needle)
+        p.write_text(s)
+        PYCODE
+        git -C linux-tkg diff -- install.sh > dist/metadata/ci-hook.patch
+        cp verify-config.py dist/metadata/
+    - name: Build kernel packages
+      working-directory: linux-tkg
+      timeout-minutes: 320
+      run: |
+        ./install.sh install < /dev/null 2>&1 | tee "$GITHUB_WORKSPACE/dist/metadata/build.log"
+    - name: Collect and verify matching image and headers
+      run: |
+        python3 - <<'PYCODE'
+        import pathlib,subprocess,shutil,hashlib
+        p=pathlib.Path('dist'); release=(p/'metadata/kernel-release.txt').read_text().strip()
+        files=list(pathlib.Path('linux-tkg/DEBS').glob('*.deb')); assert files, 'No packages produced'
+        found=set(); rows=[]
+        for f in files:
+            name=subprocess.check_output(['dpkg-deb','-f',str(f),'Package'],text=True).strip()
+            arch=subprocess.check_output(['dpkg-deb','-f',str(f),'Architecture'],text=True).strip()
+            assert arch in ['amd64','all'], 'Unexpected package architecture'
+            rows.append(f'{f.name}\t{name}\t{arch}')
+            found.add(name); shutil.copyfile(f,p/f.name)
+        assert 'linux-image-'+release in found, 'Matching image missing'
+        assert 'linux-headers-'+release in found, 'Matching headers missing'
+        (p/'metadata/packages.tsv').write_text('\n'.join(rows)+'\n')
+        (p/'SHA256SUMS').write_text(''.join(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+f.name+'\n' for f in sorted(p.glob('*.deb'))))
+        PYCODE
+        { echo '### Packages verified'; cat dist/metadata/packages.tsv; } >> "$GITHUB_STEP_SUMMARY"
+    - name: Preserve diagnostics
+      if: always()
+      run: |
+        mkdir -p dist/metadata
+        ccache --show-stats > dist/metadata/ccache.txt 2>&1 || true
+        if [ -d linux-tkg/logs ]; then cp -r linux-tkg/logs dist/metadata/tkg-logs; fi
+        if [ -f linux-tkg/kernelconfig.new ]; then cp linux-tkg/kernelconfig.new dist/metadata/tkg-final.config; fi
+    - name: Upload validated packages
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-tkg-${{ env.BUILD_SUFFIX }}
+        path: |-
+          dist/*.deb
+          dist/SHA256SUMS
+        if-no-files-found: error
+        retention-days: 30
+    - name: Upload build records even on failure
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-tkg-records-${{ inputs.machine }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: dist/metadata/
+        if-no-files-found: warn
+        retention-days: 30
