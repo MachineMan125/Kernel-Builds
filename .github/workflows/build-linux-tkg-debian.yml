@@ -1,3 +1,4 @@
+# Revision 3: adds Project C (PDS / BMQ) scheduler options.
 # Revision 2: read tkg-reference.html for required target configurations.
 # Reviewed upstream pin; full compilation and hardware testing still required.
 name: Build linux-tkg (Devuan device profiles)
@@ -18,13 +19,15 @@ name: Build linux-tkg (Devuan device profiles)
         required: true
         default: profile
       cpu_scheduler:
-        description: BORE baseline; EEVDF comparison. RT requires EEVDF.
+        description: BORE baseline; EEVDF comparison; PDS / BMQ = Project C (disables PSI and sched_ext). RT requires EEVDF.
         required: true
         type: choice
         default: bore
         options:
         - bore
         - eevdf
+        - pds
+        - bmq
       preemption:
         description: Full desktop preemption, or experimental real-time
         required: true
@@ -143,24 +146,29 @@ jobs:
         import os,re,json,pathlib
         p=pathlib.Path(os.environ['GITHUB_WORKSPACE']); e=os.environ
         profiles={'nuc7':('v7.2.5','skylake','500','4'),'z220':('v6.18.51','ivybridge','500','8'),'e6410':('v6.18.51','westmere','300','4')}
+        # Kernel series this workflow accepts. Adding one here is only half the job:
+        # the pinned linux-tkg must also carry patches for it (checked after cloning).
+        series_ok=['6.18','7.2']
         m=e['MACHINE']; assert m in profiles, 'Unknown machine'
         v,a,h,n=profiles[m]
-        for name,allowed in {'CPU_SCHEDULER':['bore','eevdf'],'PREEMPTION':['full','rt'],'COMPILER':['gcc','llvm'],'OPT_LEVEL':['1','2','3'],'CPU_GOVERNOR':['schedutil','ondemand','performance'],'MODULE_TRIMMING':['none','modprobed-db']}.items():
+        for name,allowed in {'CPU_SCHEDULER':['bore','eevdf','pds','bmq'],'PREEMPTION':['full','rt'],'COMPILER':['gcc','llvm'],'OPT_LEVEL':['1','2','3'],'CPU_GOVERNOR':['schedutil','ondemand','performance'],'MODULE_TRIMMING':['none','modprobed-db']}.items():
             assert e[name] in allowed, 'Invalid '+name
         v=v if e['KERNEL_VERSION']=='profile' else e['KERNEL_VERSION']
-        assert re.fullmatch(r'(?:v?(?:6\.18|7\.2)\.[0-9]+|(?:6\.18|7\.2)-latest)',v), 'Use a supported stable tag or series'
+        sre='|'.join(re.escape(s) for s in series_ok)
+        assert re.fullmatch(r'(?:v?(?:'+sre+r')\.[0-9]+|(?:'+sre+r')-latest)',v), 'Use a supported stable tag or series: '+', '.join(series_ok)
         if not v.endswith('-latest') and not v.startswith('v'): v='v'+v
+        series=re.match(r'v?([0-9]+\.[0-9]+)',v).group(1)
         a=a if e['CPU_ARCH']=='profile' else e['CPU_ARCH']; assert a in ['x86-64','westmere','sandybridge','ivybridge','skylake']
         h=h if e['TIMER_FREQ']=='profile' else e['TIMER_FREQ']; assert h in ['250','300','500','1000']
         n=n if e['NR_CPUS']=='profile' else e['NR_CPUS']; assert n in ['4','8']
-        assert e['PREEMPTION']!='rt' or e['CPU_SCHEDULER']=='eevdf', 'RT requires EEVDF'
+        assert e['PREEMPTION']!='rt' or e['CPU_SCHEDULER']=='eevdf', 'RT requires EEVDF (linux-tkg offers no alternative schedulers with PREEMPT_RT)'
         label=e['BUILD_LABEL']; assert re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,7}',label) or not label, 'Invalid build_label'
         c=p/'configs'/f'{m}.config'; assert c.is_file(), f'Missing {c}: export the target Devuan /boot/config-<version>; see guide'
         s=c.read_text(); assert 'CONFIG_X86_64=y' in s and 'CONFIG_MODULES=y' in s, 'Expected an x86-64 modular kernel baseline'
         if e['MODULE_TRIMMING']=='modprobed-db':
             db=p/'modules'/f'{m}.db'; assert db.is_file() and db.stat().st_size, f'Missing or empty {db}'
         suffix=f"{m}-{e['CPU_SCHEDULER']}-{e['PREEMPTION']}"+(('-'+label) if label else '')+f"-r{e['GITHUB_RUN_ID']}a{e['GITHUB_RUN_ATTEMPT']}"
-        resolved={'MACHINE':m,'VERSION':v,'ARCH':a,'HZ':h,'NR':n,'SCHEDULER':e['CPU_SCHEDULER'],'PREEMPTION':e['PREEMPTION'],'COMPILER':e['COMPILER'],'OPT':e['OPT_LEVEL'],'GOVERNOR':e['CPU_GOVERNOR'],'TRIMMING':e['MODULE_TRIMMING'],'SUFFIX':suffix}
+        resolved={'MACHINE':m,'VERSION':v,'SERIES':series,'ARCH':a,'HZ':h,'NR':n,'SCHEDULER':e['CPU_SCHEDULER'],'PREEMPTION':e['PREEMPTION'],'COMPILER':e['COMPILER'],'OPT':e['OPT_LEVEL'],'GOVERNOR':e['CPU_GOVERNOR'],'TRIMMING':e['MODULE_TRIMMING'],'SUFFIX':suffix}
         (p/'dist/metadata').mkdir(parents=True,exist_ok=True)
         (p/'dist/metadata/profile.json').write_text(json.dumps(resolved,indent=2)+'\n')
         with open(e['GITHUB_ENV'],'a') as f:
@@ -190,18 +198,52 @@ jobs:
         git -C linux-tkg checkout -q FETCH_HEAD
         [[ "$(git -C linux-tkg rev-parse HEAD)" = "$TKG_REF" ]]
         git -C linux-tkg log -1 --format=fuller > dist/metadata/tkg-commit.txt
+    - name: Check scheduler availability at the pinned commit
+      run: |
+        # linux-tkg only offers a scheduler for a series when its patch file exists.
+        # Failing here costs seconds instead of a long build that falls over in prepare.
+        case "$BUILD_SCHEDULER" in
+          pds|bmq) patch=0009-prjc.patch ;;
+          bore)    patch=0001-bore.patch ;;
+          *)       patch='' ;;
+        esac
+        {
+          echo "scheduler: $BUILD_SCHEDULER"
+          echo "series: $BUILD_SERIES"
+        } > dist/metadata/scheduler.txt
+        if [ -n "$patch" ]; then
+          f="linux-tkg/linux-tkg-patches/$BUILD_SERIES/$patch"
+          if [ ! -s "$f" ]; then
+            avail=$(ls linux-tkg/linux-tkg-patches/*/"$patch" 2>/dev/null | awk -F/ '{print $(NF-1)}' | sort -V | tr '\n' ' ')
+            echo "::error::'$BUILD_SCHEDULER' is not available for $BUILD_SERIES at TKG_REF (no $patch). Series with it: ${avail:-none}"
+            exit 1
+          fi
+          echo "patch: $patch" >> dist/metadata/scheduler.txt
+          if [ "$patch" = 0009-prjc.patch ]; then
+            # Record which Project C release (and any tkg rebase note) is being used.
+            grep -m1 -o 'ALT_SCHED_VERSION "[^"]*"' "$f" >> dist/metadata/scheduler.txt || true
+            grep -m1 '^Subject:' "$f" >> dist/metadata/scheduler.txt || true
+          fi
+        fi
+        { echo '### Scheduler'; sed 's/^/    /' dist/metadata/scheduler.txt; } >> "$GITHUB_STEP_SUMMARY"
+        cat dist/metadata/scheduler.txt
     - name: Write safely quoted TKG settings and fragments
       run: |
         python3 - <<'PYCODE'
         import pathlib,os,shlex,json,shutil
         p=pathlib.Path(os.environ['GITHUB_WORKSPACE']); e=os.environ; t=p/'linux-tkg'
+        prjc=e['BUILD_SCHEDULER'] in ('pds','bmq')
         cfg={'_distro': 'Debian', '_preempt_rt_force': '0', '_sched_yield_type': '1', '_rr_interval': 'default', '_bore_min_base_slice_ns': '2000000', '_smt_nice': 'true', '_tickless': '2', '_install_after_building': 'no', '_logging_use_script': 'no', '_menunconfig': 'false', '_diffconfig': 'false', '_user_patches': 'false', '_user_patches_no_confirm': 'false', '_config_fragments': 'true', '_config_fragments_no_confirm': 'true', '_community_patches': '', '_configfile': 'ci-base.config', '_config_updating': 'olddefconfig', '_offline': '', '_force_all_threads': 'true', '_noccache': 'false', '_glitched_base': 'true', '_zenify': 'true', '_misc_adds': 'true', '_clear_patches': 'true', '_openrgb': 'false', '_mglru': 'true', '_ntsync': 'false', '_aggressive_ondemand': 'true', '_random_trust_cpu': 'true', '_acs_override': 'false', '_ftracedisable': 'false', '_numadisable': 'false', '_debugdisable': 'false', '_STRIP': 'true', '_NR_CPUS_value': '', '_tcp_cong_alg': '', '_custom_commandline': '', '_lto_mode': 'no', '_llvm_ias': '1', '_libunwind_replace': 'false', 'KCFLAGS': '', 'KCPPFLAGS': '', 'KRUSTFLAGS': '', '_nofallback': 'true', '_kernel_on_diet': 'false'}
         cfg.update(_version=e['BUILD_VERSION'],_cpusched=e['BUILD_SCHEDULER'],_compiler=e['BUILD_COMPILER'],_compileroptlevel=e['BUILD_OPT'],_processor_opt=e['BUILD_ARCH'],_timer_freq=e['BUILD_HZ'],_default_cpu_gov=e['BUILD_GOVERNOR'],_kernel_localversion=e['BUILD_SUFFIX'],_NR_CPUS_value=e['BUILD_NR'],_preempt_rt='1' if e['BUILD_PREEMPTION']=='rt' else '0',_modprobeddb='true' if e['BUILD_TRIMMING']=='modprobed-db' else 'false',_modprobeddb_db_path=str(p/'modules'/ (e['BUILD_MACHINE']+'.db')))
         shutil.copyfile(p/'configs'/(e['BUILD_MACHINE']+'.config'),t/'ci-base.config')
         # Device fragments contain Kconfig assignments, not executable shell overrides.
         f=p/'configs'/(e['BUILD_MACHINE']+'.myfrag')
         if f.is_file(): shutil.copyfile(f,t/'10-device.myfrag')
-        common=['CONFIG_LOCALVERSION=""','# CONFIG_LOCALVERSION_AUTO is not set','CONFIG_SYSTEM_TRUSTED_KEYS=""','CONFIG_SYSTEM_REVOCATION_KEYS=""','CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"','# CONFIG_MODULE_SIG_FORCE is not set','CONFIG_CMDLINE=""','# CONFIG_CMDLINE_BOOL is not set','# CONFIG_CMDLINE_OVERRIDE is not set','CONFIG_BLK_DEV_INITRD=y','CONFIG_DEVTMPFS=y','CONFIG_DEVTMPFS_MOUNT=y','CONFIG_EFI_PARTITION=y','CONFIG_SMP=y','CONFIG_MODULES=y','CONFIG_PSI=y','CONFIG_PSI_DEFAULT_DISABLED=n','CONFIG_NO_HZ_IDLE=y','# CONFIG_NO_HZ_FULL is not set','# CONFIG_PREEMPT_NONE is not set','# CONFIG_PREEMPT_VOLUNTARY is not set']
+        common=['CONFIG_LOCALVERSION=""','# CONFIG_LOCALVERSION_AUTO is not set','CONFIG_SYSTEM_TRUSTED_KEYS=""','CONFIG_SYSTEM_REVOCATION_KEYS=""','CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"','# CONFIG_MODULE_SIG_FORCE is not set','CONFIG_CMDLINE=""','# CONFIG_CMDLINE_BOOL is not set','# CONFIG_CMDLINE_OVERRIDE is not set','CONFIG_BLK_DEV_INITRD=y','CONFIG_DEVTMPFS=y','CONFIG_DEVTMPFS_MOUNT=y','CONFIG_EFI_PARTITION=y','CONFIG_SMP=y','CONFIG_MODULES=y','CONFIG_NO_HZ_IDLE=y','# CONFIG_NO_HZ_FULL is not set','# CONFIG_PREEMPT_NONE is not set','# CONFIG_PREEMPT_VOLUNTARY is not set']
+        # Fragments are merged after linux-tkg's own config pass, so they would override
+        # its Project C workaround. linux-tkg disables PSI for PDS/BMQ; keep it that way.
+        if prjc: common+=['# CONFIG_PSI is not set']
+        else: common+=['CONFIG_PSI=y','CONFIG_PSI_DEFAULT_DISABLED=n']
         common+=['CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE='+('y' if e['BUILD_OPT']=='1' else 'n'),'CONFIG_CC_OPTIMIZE_FOR_SIZE='+('y' if e['BUILD_OPT']=='3' else 'n')]
         if e['BUILD_PREEMPTION']=='rt': common+=['CONFIG_EXPERT=y','CONFIG_PREEMPT_RT=y','# CONFIG_PREEMPT is not set','# CONFIG_PREEMPT_DYNAMIC is not set']
         else: common+=['CONFIG_PREEMPT=y','CONFIG_PREEMPT_DYNAMIC=y','# CONFIG_PREEMPT_RT is not set']
@@ -227,13 +269,11 @@ jobs:
         sudo apt-get install -y ccache gcc g++ binutils
         if [ "$BUILD_COMPILER" = llvm ]; then sudo apt-get install -y clang lld llvm; fi
         sudo /usr/sbin/update-ccache-symlinks
-        printf '%s
-        ' /usr/lib/ccache >> "$GITHUB_PATH"
+        printf '%s\n' /usr/lib/ccache >> "$GITHUB_PATH"
         ccache --max-size=2G
         ccache --zero-stats
         { gcc --version; ld --version; ccache --version; if [ "$BUILD_COMPILER" = llvm ]; then clang --version; ld.lld --version; fi; } > dist/metadata/toolchain.txt
-        printf '%s
-        ' "${ImageOS:-unknown} ${ImageVersion:-unknown}" > dist/metadata/runner.txt
+        printf '%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}" > dist/metadata/runner.txt
     - name: Install checked pre-build validation hook
       run: |
         cat > "$GITHUB_WORKSPACE/verify-config.py" <<'PYCODE'
@@ -248,10 +288,20 @@ jobs:
         checks={'CONFIG_X86_64':'y','CONFIG_SMP':'y','CONFIG_MODULES':'y','CONFIG_BLK_DEV_INITRD':'y','CONFIG_DEVTMPFS':'y','CONFIG_NO_HZ_IDLE':'y','CONFIG_NR_CPUS':e['BUILD_NR'],'CONFIG_HZ':e['BUILD_HZ'],'CONFIG_CPU_FREQ_DEFAULT_GOV_'+e['BUILD_GOVERNOR'].upper():'y'}
         checks['CONFIG_PREEMPT_RT' if e['BUILD_PREEMPTION']=='rt' else 'CONFIG_PREEMPT']='y'
         opt={'1':'CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE','2':'CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3','3':'CONFIG_CC_OPTIMIZE_FOR_SIZE'}[e['BUILD_OPT']]; checks[opt]='y'
-        if e['BUILD_SCHEDULER']=='bore': checks['CONFIG_SCHED_BORE']='y'
-        else: assert c.get('CONFIG_SCHED_BORE','n')=='n', 'Unexpected BORE'
+        errors=[]
+        sched=e['BUILD_SCHEDULER']
+        if sched=='bore': checks['CONFIG_SCHED_BORE']='y'
+        elif c.get('CONFIG_SCHED_BORE','n')!='n': errors.append('Unexpected BORE')
+        if sched in ('pds','bmq'):
+            # Project C: SCHED_ALT on, exactly the requested variant selected, PSI off.
+            checks['CONFIG_SCHED_ALT']='y'
+            checks['CONFIG_SCHED_'+sched.upper()]='y'
+            other='CONFIG_SCHED_'+('BMQ' if sched=='pds' else 'PDS')
+            if c.get(other,'n')!='n': errors.append(f'Unexpected {other}')
+            if c.get('CONFIG_PSI','n')!='n': errors.append('PSI must stay disabled with Project C')
+        elif c.get('CONFIG_SCHED_ALT','n')!='n': errors.append('Unexpected Project C (SCHED_ALT)')
         if e['BUILD_MACHINE']=='e6410': checks.update(CONFIG_SWAP='y',CONFIG_ZSWAP='y',CONFIG_ZSMALLOC='y')
-        errors=[f'{k}: expected {v}, got {c.get(k,"unset")}' for k,v in checks.items() if c.get(k)!=v]
+        errors+=[f'{k}: expected {v}, got {c.get(k,"unset")}' for k,v in checks.items() if c.get(k)!=v]
         if c.get('CONFIG_CMDLINE','""')!='""': errors.append('Unexpected built-in command line')
         if e['BUILD_PREEMPTION']=='full' and c.get('CONFIG_PREEMPT_RT','n')!='n': errors.append('Unexpected RT')
         mk=pathlib.Path('Makefile').read_text()
