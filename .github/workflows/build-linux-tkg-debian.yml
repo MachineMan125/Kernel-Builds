@@ -1,3 +1,4 @@
+# Revision 7: MuQSS + profile kernel moves 6.18 profiles to 7.2-latest; Node 24 action versions.
 # Revision 6: really disables debug info (no -dbg package) unless sched_ext=require.
 # Revision 5: MuQSS defaults to Con Kolivas' 100 Hz tick; 100 Hz selectable.
 # Revision 4: adds MuQSS (-ck, 7.1+ only) and optional sched_ext support.
@@ -18,7 +19,7 @@ name: Build linux-tkg (Devuan device profiles)
         - z220
         - e6410
       kernel_version:
-        description: 'profile, exact tag (v6.18.51), or series (6.18-latest). Supported: 6.18 / 7.2'
+        description: 'profile, exact tag (v6.18.51), or series (6.18-latest). Supported: 6.18 / 7.2. MuQSS + profile uses 7.2-latest'
         required: true
         default: profile
       cpu_scheduler:
@@ -149,7 +150,7 @@ jobs:
     timeout-minutes: 350
     steps:
     - name: Checkout private repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         persist-credentials: false
     - name: Resolve profile and validate inputs
@@ -180,6 +181,11 @@ jobs:
         v,a,h,n=profiles[m]
         for name,allowed in {'CPU_SCHEDULER':['bore','eevdf','pds','bmq','muqss'],'MUQSS_RUNQUEUE':['smt','none','mc','mc-llc','smp','all'],'SCHED_EXT':['auto','require'],'PREEMPTION':['full','rt'],'COMPILER':['gcc','llvm'],'OPT_LEVEL':['1','2','3'],'CPU_GOVERNOR':['schedutil','ondemand','performance'],'MODULE_TRIMMING':['none','modprobed-db']}.items():
             assert e[name] in allowed, 'Invalid '+name
+        # MuQSS only exists for 7.1+. With kernel_version=profile, move 6.18 profiles to the newest
+        # supported series instead of failing. An explicitly typed version is left alone.
+        if e['KERNEL_VERSION']=='profile' and e['CPU_SCHEDULER']=='muqss' and not v.startswith('v7.'):
+            print(f'::notice::MuQSS needs Linux 7.1 or newer; {m} profile kernel {v} replaced with 7.2-latest')
+            v='7.2-latest'
         v=v if e['KERNEL_VERSION']=='profile' else e['KERNEL_VERSION']
         sre='|'.join(re.escape(s) for s in series_ok)
         assert re.fullmatch(r'(?:v?(?:'+sre+r')\.[0-9]+|(?:'+sre+r')-latest)',v), 'Use a supported stable tag or series: '+', '.join(series_ok)
@@ -312,7 +318,7 @@ jobs:
         for f in t.glob('*.myfrag'): shutil.copyfile(f,p/'dist/metadata'/f.name)
         PYCODE
     - name: Restore compiler cache
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ${{ env.CCACHE_DIR }}
         key: tkg-${{ runner.os }}-${{ inputs.machine }}-${{ env.TKG_REF }}-${{ env.BUILD_COMPILER }}-${{ env.BUILD_ARCH
@@ -419,7 +425,7 @@ jobs:
         if [ -d linux-tkg/logs ]; then cp -r linux-tkg/logs dist/metadata/tkg-logs; fi
         if [ -f linux-tkg/kernelconfig.new ]; then cp linux-tkg/kernelconfig.new dist/metadata/tkg-final.config; fi
     - name: Upload validated packages
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: linux-tkg-${{ env.BUILD_SUFFIX }}
         path: |-
@@ -429,7 +435,7 @@ jobs:
         retention-days: 30
     - name: Upload build records even on failure
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: linux-tkg-records-${{ inputs.machine }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: dist/metadata/
