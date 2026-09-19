@@ -1,3 +1,4 @@
+# Revision 5: MuQSS defaults to Con Kolivas' 100 Hz tick; 100 Hz selectable.
 # Revision 4: adds MuQSS (-ck, 7.1+ only) and optional sched_ext support.
 # Revision 3: adds Project C (PDS / BMQ) scheduler options.
 # Revision 2: read tkg-reference.html for required target configurations.
@@ -76,12 +77,13 @@ name: Build linux-tkg (Devuan device profiles)
         - '2'
         - '3'
       timer_freq:
-        description: 'profile: NUC 500, Z220 500, E6410 300 Hz'
+        description: 'profile: NUC 500, Z220 500, E6410 300 Hz; MuQSS always 100 Hz (-ck default)'
         required: true
         type: choice
         default: profile
         options:
         - profile
+        - '100'
         - '250'
         - '300'
         - '500'
@@ -183,7 +185,11 @@ jobs:
         if not v.endswith('-latest') and not v.startswith('v'): v='v'+v
         series=re.match(r'v?([0-9]+\.[0-9]+)',v).group(1)
         a=a if e['CPU_ARCH']=='profile' else e['CPU_ARCH']; assert a in ['x86-64','westmere','sandybridge','ivybridge','skylake']
-        h=h if e['TIMER_FREQ']=='profile' else e['TIMER_FREQ']; assert h in ['250','300','500','1000']
+        # MuQSS is built around a low tick: -ck converts short sleeps and timeouts to hrtimers,
+        # so 'profile' follows Con Kolivas' 100 Hz default. An explicit value still wins.
+        if e['TIMER_FREQ']=='profile': h='100' if e['CPU_SCHEDULER']=='muqss' else h
+        else: h=e['TIMER_FREQ']
+        assert h in ['100','250','300','500','1000']
         n=n if e['NR_CPUS']=='profile' else e['NR_CPUS']; assert n in ['4','8']
         assert e['PREEMPTION']!='rt' or e['CPU_SCHEDULER']=='eevdf', 'RT requires EEVDF (linux-tkg offers no alternative schedulers with PREEMPT_RT)'
         assert e['SCHED_EXT']!='require' or e['CPU_SCHEDULER'] in ('bore','eevdf'), 'sched_ext only works with BORE or EEVDF; PDS, BMQ and MuQSS replace the scheduler core it plugs into'
