@@ -1,3 +1,4 @@
+# Revision 6: really disables debug info (no -dbg package) unless sched_ext=require.
 # Revision 5: MuQSS defaults to Con Kolivas' 100 Hz tick; 100 Hz selectable.
 # Revision 4: adds MuQSS (-ck, 7.1+ only) and optional sched_ext support.
 # Revision 3: adds Project C (PDS / BMQ) scheduler options.
@@ -297,7 +298,11 @@ jobs:
         common+=['CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE='+('y' if e['BUILD_OPT']=='1' else 'n'),'CONFIG_CC_OPTIMIZE_FOR_SIZE='+('y' if e['BUILD_OPT']=='3' else 'n')]
         if e['BUILD_PREEMPTION']=='rt': common+=['CONFIG_EXPERT=y','CONFIG_PREEMPT_RT=y','# CONFIG_PREEMPT is not set','# CONFIG_PREEMPT_DYNAMIC is not set']
         else: common+=['CONFIG_PREEMPT=y','CONFIG_PREEMPT_DYNAMIC=y','# CONFIG_PREEMPT_RT is not set']
-        if scx: common+=['CONFIG_BPF=y','CONFIG_BPF_SYSCALL=y','CONFIG_BPF_JIT=y','# CONFIG_DEBUG_INFO_NONE is not set','CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y','# CONFIG_DEBUG_INFO_REDUCED is not set','# CONFIG_DEBUG_INFO_SPLIT is not set','CONFIG_DEBUG_INFO_BTF=y','CONFIG_DEBUG_INFO_BTF_MODULES=y','CONFIG_SCHED_CLASS_EXT=y']
+        # Debug info is a Kconfig choice. linux-tkg's _STRIP only flips DEBUG_INFO_NONE on and leaves the
+        # Devuan config's DWARF choice set too, so the DWARF entry wins and debug info (plus a -dbg package)
+        # stays on. Every member is set explicitly here; fragments are merged last, so this decides it.
+        if scx: common+=['CONFIG_BPF=y','CONFIG_BPF_SYSCALL=y','CONFIG_BPF_JIT=y','# CONFIG_DEBUG_INFO_NONE is not set','CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y','# CONFIG_DEBUG_INFO_DWARF4 is not set','# CONFIG_DEBUG_INFO_DWARF5 is not set','# CONFIG_DEBUG_INFO_REDUCED is not set','# CONFIG_DEBUG_INFO_SPLIT is not set','CONFIG_DEBUG_INFO_BTF=y','CONFIG_DEBUG_INFO_BTF_MODULES=y','CONFIG_SCHED_CLASS_EXT=y']
+        else: common+=['CONFIG_DEBUG_INFO_NONE=y','# CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT is not set','# CONFIG_DEBUG_INFO_DWARF4 is not set','# CONFIG_DEBUG_INFO_DWARF5 is not set']
         if e['BUILD_MACHINE']=='e6410': common+=['CONFIG_SWAP=y','CONFIG_ZSWAP=y','CONFIG_ZSMALLOC=y','CONFIG_CRYPTO_ZSTD=y','CONFIG_CRYPTO_LZ4=y']
         (t/'99-ci.myfrag').write_text('\n'.join(common)+'\n')
         f=pathlib.Path.home()/'.config/frogminer/linux-tkg.cfg'; f.parent.mkdir(parents=True,exist_ok=True)
@@ -358,6 +363,7 @@ jobs:
         elif c.get('CONFIG_SCHED_MUQSS','n')!='n': errors.append('Unexpected MuQSS')
         if sched in ('pds','bmq','muqss') and c.get('CONFIG_PSI','n')!='n': errors.append('PSI must stay disabled with PDS/BMQ/MuQSS')
         if e['BUILD_SCHED_EXT']=='require': checks.update(CONFIG_DEBUG_INFO_BTF='y',CONFIG_SCHED_CLASS_EXT='y')
+        elif c.get('CONFIG_DEBUG_INFO','n')!='n': errors.append('Debug info still enabled; the build would be slower and produce a -dbg package')
         if e['BUILD_MACHINE']=='e6410': checks.update(CONFIG_SWAP='y',CONFIG_ZSWAP='y',CONFIG_ZSMALLOC='y')
         errors+=[f'{k}: expected {v}, got {c.get(k,"unset")}' for k,v in checks.items() if c.get(k)!=v]
         if c.get('CONFIG_CMDLINE','""')!='""': errors.append('Unexpected built-in command line')
