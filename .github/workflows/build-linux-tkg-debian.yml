@@ -1,3 +1,4 @@
+# Revision 10: MuQSS SCHED_CLASS_EXT hunk rebuilt from the patch itself (anchored only on the config + prompt lines) after 7.2.7 rejected it; pre-build verifies the gate landed; NUC profile moves to v7.2.7.
 # Revision 9: context-tolerant MuQSS SCHED_CLASS_EXT hunk; pre-build fails on rejected hunks or sched_ext + MuQSS.
 # Revision 8: MuQSS v0.31 compatibility shim for 7.2.5+ (missing rt_mutex_futex_* helpers).
 # Revision 7: MuQSS + profile kernel moves 6.18 profiles to 7.2-latest; Node 24 action versions.
@@ -175,7 +176,7 @@ jobs:
         python3 - <<'PYCODE'
         import os,re,json,pathlib
         p=pathlib.Path(os.environ['GITHUB_WORKSPACE']); e=os.environ
-        profiles={'nuc7':('v7.2.5','skylake','500','4'),'z220':('v6.18.51','ivybridge','500','8'),'e6410':('v6.18.51','westmere','300','4')}
+        profiles={'nuc7':('v7.2.7','skylake','500','4'),'z220':('v6.18.51','ivybridge','500','8'),'e6410':('v6.18.51','westmere','300','4')}
         # Kernel series this workflow accepts. Adding one here is only half the job:
         # the pinned linux-tkg must also carry patches for it (checked after cloning).
         series_ok=['6.18','7.2']
@@ -285,40 +286,71 @@ jobs:
       if: env.BUILD_SCHEDULER == 'muqss'
       run: |
         python3 - <<'PYCODE'
-        # MuQSS v0.31 gates SCHED_CLASS_EXT in kernel/Kconfig.preempt by editing its "depends on" line.
-        # That hunk's trailing context expects "select STACKTRACE" right after it, but newer trees insert
-        # "select GENERIC_ALLOCATOR" there, so patch rejects the hunk and sched_ext stays selectable under
-        # MuQSS. Swap it for an equivalent hunk: a separate "depends on !SCHED_MUQSS" (Kconfig ANDs multiple
-        # depends lines) anchored only on the long-stable bool and depends lines.
+        # MuQSS v0.31 gates SCHED_CLASS_EXT in kernel/Kconfig.preempt with a hunk that rewrites the entry's
+        # "depends on" line and carries several lines of context around it. Stable updates keep changing the
+        # depends/select lines of that entry (7.2.x added "select GENERIC_ALLOCATOR"; 7.2.7 rejected even the
+        # Revision 9 replacement: "Hunk #3 FAILED at 170"), so linux-tkg stops in prepare.
+        # The hunk is now located structurally (whatever its context) and rebuilt as a one-line insertion
+        # anchored only on the entry's "config" line and its prompt, which are unchanged since sched_ext landed:
+        #      config SCHED_CLASS_EXT
+        #     +	depends on !SCHED_MUQSS
+        #      	bool "Extensible Scheduling Class"
+        # Kconfig ANDs all "depends on" lines of an entry and attribute order does not matter.
+        # verify-config.py later confirms the gate really sits in the SCHED_CLASS_EXT entry.
         import os,re,pathlib
         e=os.environ; p=pathlib.Path(e['GITHUB_WORKSPACE'])
         f=p/'linux-tkg/linux-tkg-patches'/e['BUILD_SERIES']/'0004-muqss.patch'
         out=p/'dist/metadata/muqss-kconfig-fix.txt'
         def note(msg,level='notice'):
             print(f'::{level}::muqss-kconfig-fix: {msg}'); out.write_text(msg+'\n')
-        s=f.read_text()
-        body=(' \n'
-              ' config SCHED_CLASS_EXT\n'
-              ' \tbool "Extensible Scheduling Class"\n'
-              '-\tdepends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF\n'
-              '+\tdepends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF && !SCHED_MUQSS\n'
-              ' \tselect STACKTRACE if STACKTRACE_SUPPORT\n'
-              ' \thelp\n'
-              ' \t  This option enables a new scheduler class sched_ext (SCX), which\n')
-        old=re.compile(r'^@@ -(\d+),7 \+(\d+),7 @@ config SCHED_CORE\n'+re.escape(body),re.M)
-        fixed='+\tdepends on !SCHED_MUQSS\n \tdepends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF\n'
-        hits=old.findall(s)
-        if len(hits)==1:
-            a,b=(int(x) for x in hits[0])
-            new=(f'@@ -{a+2},2 +{b+2},3 @@ config SCHED_CORE\n'
-                 ' \tbool "Extensible Scheduling Class"\n'+fixed)
-            f.write_text(old.sub(lambda m: new,s))
-            note('replaced SCHED_CLASS_EXT hunk with context-tolerant version')
-        elif fixed in s:
-            note('patch already carries the context-tolerant SCHED_CLASS_EXT hunk; nothing to do')
+        def fail(msg):
+            note(msg,'error'); raise SystemExit(1)
+        src=f.read_text(); lines=src.splitlines(keepends=True)
+        hdr=re.compile(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+        prompt='bool "Extensible Scheduling Class"'
+        res=[]; cur=None; done=0; i=0
+        while i<len(lines):
+            l=lines[i]
+            if l.startswith('+++ '):
+                cur=l[4:].split('\t')[0].strip(); res.append(l); i+=1; continue
+            m=hdr.match(l)
+            if not m:
+                res.append(l); i+=1; continue
+            a,ac,b,bc=int(m[1]),int(m[2] or 1),int(m[3]),int(m[4] or 1)
+            j=i+1; o=n=0
+            while o<ac or n<bc:
+                if j>=len(lines): fail(f'truncated hunk at {f.name}:{i+1}')
+                t=lines[j][:1]
+                if t in (' ','\n'): o+=1; n+=1
+                elif t=='-': o+=1
+                elif t=='+': n+=1
+                elif t!='\\': fail(f'malformed hunk at {f.name}:{i+1}')
+                j+=1
+            while j<len(lines) and lines[j].startswith('\\'): j+=1
+            body=lines[i+1:j]; text=''.join(body)
+            if cur=='b/kernel/Kconfig.preempt' and '!SCHED_MUQSS' in text and 'Extensible Scheduling Class' in text:
+                ol=a
+                for bl in body:
+                    if bl.startswith(' ') and prompt in bl: break
+                    if bl[:1] in (' ','\n','-'): ol+=1
+                else:
+                    fail(f'SCHED_CLASS_EXT prompt is not a context line in its hunk ({f.name}:{i+1}); review 0004-muqss.patch')
+                res.append(f'@@ -{ol-1},2 +{ol-1+b-a},3 @@\n config SCHED_CLASS_EXT\n+\tdepends on !SCHED_MUQSS\n'+bl)
+                done+=1
+            else:
+                res+=[l]+body
+            i=j
+        new=''.join(res)
+        if done>1: fail(f'{done} SCHED_CLASS_EXT hunks found in {f.name}; expected one')
+        if done==0:
+            # Not fatal here: a newer MuQSS may carry its own fix. verify-config.py still fails the build on any
+            # .rej file, on sched_ext + MuQSS, or on a missing gate.
+            note('SCHED_CLASS_EXT hunk not found; review 0004-muqss.patch before updating TKG_REF','warning')
+        elif new==src:
+            note('patch already carries the minimal SCHED_CLASS_EXT hunk; nothing to do')
         else:
-            # Not fatal here: verify-config.py fails the build on any .rej file or on sched_ext + MuQSS.
-            note('SCHED_CLASS_EXT hunk not found in expected form; review 0004-muqss.patch before updating TKG_REF','warning')
+            f.write_text(new)
+            note('replaced SCHED_CLASS_EXT hunk with a config+prompt anchored insertion')
         PYCODE
     - name: Write safely quoted TKG settings and fragments
       run: |
@@ -451,6 +483,11 @@ jobs:
         elif c.get('CONFIG_SCHED_MUQSS','n')!='n': errors.append('Unexpected MuQSS')
         # MuQSS replaces the scheduler core sched_ext plugs into; if its Kconfig gate was lost, catch it here.
         if sched=='muqss' and c.get('CONFIG_SCHED_CLASS_EXT','n')!='n': errors.append('sched_ext enabled with MuQSS; Kconfig gate missing')
+        # The rewritten hunk is anchored on very little context, so confirm the gate landed inside the
+        # SCHED_CLASS_EXT entry itself rather than anywhere else in the file.
+        if sched=='muqss':
+            blk=re.search(r'^config SCHED_CLASS_EXT\n(.*?)(?=^\S|\Z)',pathlib.Path('kernel/Kconfig.preempt').read_text(),re.M|re.S)
+            if blk and not re.search(r'^\s+depends on[^\n]*!SCHED_MUQSS',blk.group(1),re.M): errors.append('MuQSS gate (depends on !SCHED_MUQSS) missing from SCHED_CLASS_EXT in kernel/Kconfig.preempt')
         # patch keeps going after a failed hunk; a .rej file means part of a patch is silently missing.
         rej=sorted(str(r) for r in pathlib.Path('.').rglob('*.rej') if '.git' not in r.parts)
         if rej: errors.append('Rejected patch hunks: '+', '.join(rej))
