@@ -1,3 +1,4 @@
+# Revision 9: context-tolerant MuQSS SCHED_CLASS_EXT hunk; pre-build fails on rejected hunks or sched_ext + MuQSS.
 # Revision 8: MuQSS v0.31 compatibility shim for 7.2.5+ (missing rt_mutex_futex_* helpers).
 # Revision 7: MuQSS + profile kernel moves 6.18 profiles to 7.2-latest; Node 24 action versions.
 # Revision 6: really disables debug info (no -dbg package) unless sched_ext=require.
@@ -280,6 +281,45 @@ jobs:
         fi
         { echo '### Scheduler'; sed 's/^/    /' dist/metadata/scheduler.txt; } >> "$GITHUB_STEP_SUMMARY"
         cat dist/metadata/scheduler.txt
+    - name: Fix MuQSS SCHED_CLASS_EXT Kconfig hunk
+      if: env.BUILD_SCHEDULER == 'muqss'
+      run: |
+        python3 - <<'PYCODE'
+        # MuQSS v0.31 gates SCHED_CLASS_EXT in kernel/Kconfig.preempt by editing its "depends on" line.
+        # That hunk's trailing context expects "select STACKTRACE" right after it, but newer trees insert
+        # "select GENERIC_ALLOCATOR" there, so patch rejects the hunk and sched_ext stays selectable under
+        # MuQSS. Swap it for an equivalent hunk: a separate "depends on !SCHED_MUQSS" (Kconfig ANDs multiple
+        # depends lines) anchored only on the long-stable bool and depends lines.
+        import os,re,pathlib
+        e=os.environ; p=pathlib.Path(e['GITHUB_WORKSPACE'])
+        f=p/'linux-tkg/linux-tkg-patches'/e['BUILD_SERIES']/'0004-muqss.patch'
+        out=p/'dist/metadata/muqss-kconfig-fix.txt'
+        def note(msg,level='notice'):
+            print(f'::{level}::muqss-kconfig-fix: {msg}'); out.write_text(msg+'\n')
+        s=f.read_text()
+        body=(' \n'
+              ' config SCHED_CLASS_EXT\n'
+              ' \tbool "Extensible Scheduling Class"\n'
+              '-\tdepends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF\n'
+              '+\tdepends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF && !SCHED_MUQSS\n'
+              ' \tselect STACKTRACE if STACKTRACE_SUPPORT\n'
+              ' \thelp\n'
+              ' \t  This option enables a new scheduler class sched_ext (SCX), which\n')
+        old=re.compile(r'^@@ -(\d+),7 \+(\d+),7 @@ config SCHED_CORE\n'+re.escape(body),re.M)
+        fixed='+\tdepends on !SCHED_MUQSS\n \tdepends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF\n'
+        hits=old.findall(s)
+        if len(hits)==1:
+            a,b=(int(x) for x in hits[0])
+            new=(f'@@ -{a+2},2 +{b+2},3 @@ config SCHED_CORE\n'
+                 ' \tbool "Extensible Scheduling Class"\n'+fixed)
+            f.write_text(old.sub(lambda m: new,s))
+            note('replaced SCHED_CLASS_EXT hunk with context-tolerant version')
+        elif fixed in s:
+            note('patch already carries the context-tolerant SCHED_CLASS_EXT hunk; nothing to do')
+        else:
+            # Not fatal here: verify-config.py fails the build on any .rej file or on sched_ext + MuQSS.
+            note('SCHED_CLASS_EXT hunk not found in expected form; review 0004-muqss.patch before updating TKG_REF','warning')
+        PYCODE
     - name: Write safely quoted TKG settings and fragments
       run: |
         python3 - <<'PYCODE'
@@ -409,6 +449,11 @@ jobs:
             checks['CONFIG_SCHED_MUQSS']='y'
             checks['CONFIG_RQ_'+e['BUILD_RUNQUEUE'].upper().replace('-','_')]='y'
         elif c.get('CONFIG_SCHED_MUQSS','n')!='n': errors.append('Unexpected MuQSS')
+        # MuQSS replaces the scheduler core sched_ext plugs into; if its Kconfig gate was lost, catch it here.
+        if sched=='muqss' and c.get('CONFIG_SCHED_CLASS_EXT','n')!='n': errors.append('sched_ext enabled with MuQSS; Kconfig gate missing')
+        # patch keeps going after a failed hunk; a .rej file means part of a patch is silently missing.
+        rej=sorted(str(r) for r in pathlib.Path('.').rglob('*.rej') if '.git' not in r.parts)
+        if rej: errors.append('Rejected patch hunks: '+', '.join(rej))
         if sched in ('pds','bmq','muqss') and c.get('CONFIG_PSI','n')!='n': errors.append('PSI must stay disabled with PDS/BMQ/MuQSS')
         if e['BUILD_SCHED_EXT']=='require': checks.update(CONFIG_DEBUG_INFO_BTF='y',CONFIG_SCHED_CLASS_EXT='y')
         elif c.get('CONFIG_DEBUG_INFO','n')!='n': errors.append('Debug info still enabled; the build would be slower and produce a -dbg package')
