@@ -1,0 +1,297 @@
+# CachyOS kernel for Core i3-6100 desktop (Core i3-6100, Skylake-S (2 cores / 4 threads))
+# Generated 2026-09-23 by the CachyOS kernel workflow builder.
+# Run it from the Actions tab (workflow_dispatch). Output: .deb packages for Devuan 6 (excalibur).
+name: "CachyOS kernel for i3-6100"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cachyos-kernel-i3-6100
+  cancel-in-progress: false
+
+env:
+  TARGET: "i3-6100"
+  VERSION_MODE: "latest-lts"  # latest-lts | latest-stable | manual
+  VERSION_REQUEST: ""  # only used when VERSION_MODE is manual
+  X86_64_LEVEL: "3"
+  MTUNE: "skylake"
+  CPU_SCHED: "eevdf"  # eevdf | bore
+  HZ: "500"
+  CONFIG_SOURCE: "cachyos"  # cachyos | localmodconfig | repo
+  CONFIG_PATH: ""
+  LSMOD_PATH: ""
+  DEBUG_INFO: "none"  # none | reduced
+  BUILD_IMAGE: "debian:trixie"
+  CACHYOS_PKGBUILDS: "https://raw.githubusercontent.com/CachyOS/linux-cachyos/master"
+  CACHYOS_LINUX: "https://github.com/CachyOS/linux"
+
+jobs:
+  resolve:
+    name: Validate inputs and resolve source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      flavor: ${{ steps.resolve.outputs.flavor }}
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Invalid input::$*"; exit 1; }
+          safe_path() { [[ "$1" =~ ^[A-Za-z0-9._/-]+$ && "$1" != /* && "$1" != *..* ]]; }
+
+          case "$TARGET" in
+            z220|e6410) max_level=2 ;;
+            nuc7|i3-6100) max_level=3 ;;
+            *) fail "TARGET '$TARGET' must be z220, nuc7, i3-6100 or e6410" ;;
+          esac
+          case "$VERSION_MODE" in
+            latest-lts|latest-stable)
+              [ -z "$VERSION_REQUEST" ] || fail "VERSION_REQUEST must be empty when VERSION_MODE is $VERSION_MODE" ;;
+            manual)
+              [[ "$VERSION_REQUEST" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] \
+                || fail "VERSION_REQUEST '$VERSION_REQUEST' must look like 6.18 or 6.18.52" ;;
+            *) fail "VERSION_MODE '$VERSION_MODE' must be latest-lts, latest-stable or manual" ;;
+          esac
+          [[ "$X86_64_LEVEL" =~ ^[1-4]$ ]] || fail "X86_64_LEVEL '$X86_64_LEVEL' must be 1 to 4"
+          [ "$X86_64_LEVEL" -le "$max_level" ] \
+            || fail "x86-64-v$X86_64_LEVEL will not boot on $TARGET (highest supported level is v$max_level)"
+          [[ "$MTUNE" =~ ^[a-z0-9-]+$ ]] || fail "MTUNE '$MTUNE' is not a valid -mtune value"
+          case "$CPU_SCHED" in eevdf|bore) ;; *) fail "CPU_SCHED must be eevdf or bore" ;; esac
+          case "$HZ" in 100|250|300|500|600|750|1000) ;; *) fail "HZ '$HZ' is not a supported tick rate" ;; esac
+          case "$DEBUG_INFO" in none|reduced) ;; *) fail "DEBUG_INFO must be none or reduced" ;; esac
+          case "$CONFIG_SOURCE" in
+            cachyos) ;;
+            repo) safe_path "$CONFIG_PATH" || fail "CONFIG_PATH '$CONFIG_PATH' must be a relative path inside this repo" ;;
+            localmodconfig) safe_path "$LSMOD_PATH" || fail "LSMOD_PATH '$LSMOD_PATH' must be a relative path inside this repo" ;;
+            *) fail "CONFIG_SOURCE must be cachyos, localmodconfig or repo" ;;
+          esac
+          echo "Inputs OK: $TARGET, $VERSION_MODE ${VERSION_REQUEST}, x86-64-v$X86_64_LEVEL, -mtune=$MTUNE, $CPU_SCHED, ${HZ} Hz, config=$CONFIG_SOURCE"
+
+      - name: Resolve CachyOS kernel source
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Source not found::$*"; exit 1; }
+          pkgvar() { sed -nE "s/^$2=([0-9.]+)[[:space:]]*$/\1/p" "$1" | head -n1; }
+
+          curl -fsSL --retry 3 -o lts.PKGBUILD "$CACHYOS_PKGBUILDS/linux-cachyos-lts/PKGBUILD"
+          curl -fsSL --retry 3 -o stable.PKGBUILD "$CACHYOS_PKGBUILDS/linux-cachyos/PKGBUILD"
+          lts_major=$(pkgvar lts.PKGBUILD _major);       lts_minor=$(pkgvar lts.PKGBUILD _minor)
+          stable_major=$(pkgvar stable.PKGBUILD _major); stable_minor=$(pkgvar stable.PKGBUILD _minor)
+          if [ -z "$lts_major" ] || [ -z "$lts_minor" ] || [ -z "$stable_major" ] || [ -z "$stable_minor" ]; then
+            fail "Could not read _major/_minor from the linux-cachyos PKGBUILDs; their layout may have changed"
+          fi
+          echo "CachyOS packages now: linux-cachyos $stable_major.$stable_minor, linux-cachyos-lts $lts_major.$lts_minor"
+
+          case "$VERSION_MODE" in
+            latest-lts)    want="$lts_major.$lts_minor" ;;
+            latest-stable) want="$stable_major.$stable_minor" ;;
+            *)             want="$VERSION_REQUEST" ;;
+          esac
+          series=$(cut -d. -f1,2 <<<"$want")
+
+          tags=$(git ls-remote --tags --refs "$CACHYOS_LINUX" "cachyos-$series.*" \
+                   | sed -E 's#.*refs/tags/##' \
+                   | grep -E '^cachyos-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$' | sort -V || true)
+          [ -n "$tags" ] || fail "CachyOS/linux has no release tags for the $series series"
+          newest=$(tail -n1 <<<"$tags")
+          if [ "$want" = "$series" ]; then
+            tag=$newest
+          else
+            tag=$(grep -E "^cachyos-${want//./\\.}-[0-9]+$" <<<"$tags" | tail -n1 || true)
+            [ -n "$tag" ] || fail "No CachyOS/linux release for $want. Newest in $series is $(sed -E 's/^cachyos-//; s/-[0-9]+$//' <<<"$newest")"
+          fi
+          version=$(sed -E 's/^cachyos-//; s/-[0-9]+$//' <<<"$tag")
+
+          case "$series" in
+            "$lts_major")    flavor=linux-cachyos-lts ;;
+            "$stable_major") flavor=linux-cachyos ;;
+            *) flavor=linux-cachyos-lts
+               echo "::warning title=Config base::$series is neither the LTS ($lts_major) nor the stable ($stable_major) series; starting from the LTS config" ;;
+          esac
+
+          url="$CACHYOS_LINUX/releases/download/$tag/$tag.tar.gz"
+          curl -fsIL --retry 3 -o /dev/null "$url" || fail "Release tarball is missing: $url"
+
+          { echo "version=$version"; echo "tag=$tag"; echo "flavor=$flavor"; } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Source resolved"
+            echo "| Machine | Request | Tag | Base config |"
+            echo "|---|---|---|---|"
+            echo "| $TARGET | $VERSION_MODE $VERSION_REQUEST | $tag | $flavor/config |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ needs.resolve.outputs.tag }} for i3-6100
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      FLAVOR: ${{ needs.resolve.outputs.flavor }}
+      RUN_TAG: r${{ github.run_id }}a${{ github.run_attempt }}
+    steps:
+      - name: Free disk space on the runner
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null || true
+          df -h /
+
+      - name: Check out config files from this repo
+        if: env.CONFIG_SOURCE != 'cachyos'
+        uses: actions/checkout@v7
+        with:
+          path: repo
+          persist-credentials: false
+
+      - name: Fetch source and base config
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Missing file::$*"; exit 1; }
+          mkdir -p work out
+          curl -fL --retry 3 --no-progress-meter -o "work/$TAG.tar.gz" \
+            "$CACHYOS_LINUX/releases/download/$TAG/$TAG.tar.gz"
+          curl -fsSL --retry 3 -o work/cachyos.config "$CACHYOS_PKGBUILDS/$FLAVOR/config"
+          case "$CONFIG_SOURCE" in
+            repo)
+              [ -s "repo/$CONFIG_PATH" ] || fail "$CONFIG_PATH is missing or empty in this repo"
+              cp "repo/$CONFIG_PATH" work/base.config ;;
+            localmodconfig)
+              [ -s "repo/$LSMOD_PATH" ] || fail "$LSMOD_PATH is missing or empty in this repo"
+              grep -q '^Module ' "repo/$LSMOD_PATH" || fail "$LSMOD_PATH does not look like lsmod output"
+              cp "repo/$LSMOD_PATH" work/lsmod.txt
+              cp work/cachyos.config work/base.config ;;
+            *)
+              cp work/cachyos.config work/base.config ;;
+          esac
+          inputs=("$TAG.tar.gz" base.config)
+          if [ "$CPU_SCHED" = bore ]; then
+            series=$(cut -d. -f1,2 <<<"$VERSION")
+            curl -fsSL --retry 3 -o work/bore.patch \
+              "https://raw.githubusercontent.com/cachyos/kernel-patches/master/$series/sched/0001-bore-cachy.patch" \
+              || fail "CachyOS publishes no BORE patch for $series; choose EEVDF"
+            inputs+=(bore.patch)
+          fi
+          (cd work && sha256sum "${inputs[@]}") | tee out/SHA256SUMS.inputs
+
+      - name: Write build script
+        shell: bash
+        run: |
+          cat > work/build.sh <<'BUILD'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential bc bison flex gawk cpio kmod rsync zstd xz-utils python3 perl \
+            libelf-dev libssl-dev openssl libdw-dev dwarves debhelper dpkg-dev ca-certificates >/dev/null
+          echo "gcc $(gcc -dumpfullversion)"
+
+          tar -xzf "$TAG.tar.gz"
+          [ -d "$TAG" ] || { echo "::error::Tarball has no top-level $TAG directory"; ls; exit 1; }
+          cd "$TAG"
+          if [ "$CPU_SCHED" = bore ]; then
+            patch -p1 --dry-run -s -f < ../bore.patch >/dev/null \
+              || { echo "::error title=BORE patch::CachyOS's BORE patch does not apply to $VERSION yet; choose EEVDF or another version"; exit 1; }
+            patch -p1 -s < ../bore.patch
+          fi
+          cp ../base.config .config
+
+          if [ "$CONFIG_SOURCE" = localmodconfig ]; then
+            make -s olddefconfig
+            (yes '' || true) | make -s LSMOD=../lsmod.txt localmodconfig
+          fi
+
+          localversion="-cachyos-$TARGET-$RUN_TAG"
+          sc() { scripts/config "$@"; }
+          sc --set-str LOCALVERSION "$localversion" -d LOCALVERSION_AUTO
+          sc -d MZEN4 -d X86_NATIVE_CPU -e GENERIC_CPU --set-val X86_64_VERSION "$X86_64_LEVEL"
+          sc -d HZ_100 -d HZ_250 -d HZ_300 -d HZ_500 -d HZ_600 -d HZ_750 -d HZ_1000 \
+             -e "HZ_$HZ" --set-val HZ "$HZ"
+          if [ "$CPU_SCHED" = bore ]; then sc -e SCHED_BORE; else sc -d SCHED_BORE; fi
+          if [ "$CONFIG_SOURCE" != repo ]; then
+            # Same defaults the linux-cachyos PKGBUILD applies to GCC builds
+            sc -e CACHY -d CC_OPTIMIZE_FOR_PERFORMANCE -e CC_OPTIMIZE_FOR_PERFORMANCE_O3 \
+               -d HZ_PERIODIC -d NO_HZ_IDLE -d CONTEXT_TRACKING_FORCE -e NO_HZ_FULL_NODEF \
+               -e NO_HZ_FULL -e NO_HZ -e NO_HZ_COMMON -e CONTEXT_TRACKING \
+               -e PREEMPT_DYNAMIC -e PREEMPT -d PREEMPT_VOLUNTARY -d PREEMPT_LAZY -d PREEMPT_NONE \
+               -d TRANSPARENT_HUGEPAGE_MADVISE -e TRANSPARENT_HUGEPAGE_ALWAYS -e USER_NS
+          fi
+          # Debian's rustc is older than the one CachyOS builds with; none of these machines need Rust drivers
+          sc -d RUST
+          sc --set-str SYSTEM_TRUSTED_KEYS "" --set-str SYSTEM_REVOCATION_KEYS ""
+          if [ "$DEBUG_INFO" = none ]; then
+            sc -d DEBUG_INFO -d DEBUG_INFO_DWARF4 -d DEBUG_INFO_DWARF5 \
+               -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT -d DEBUG_INFO_BTF -e DEBUG_INFO_NONE
+          else
+            sc -e DEBUG_INFO_REDUCED
+          fi
+          make -s olddefconfig
+          make -s syncconfig   # refresh include/config so kernelrelease reflects the final .config
+
+          bad=0
+          need()   { grep -qxF "$1" .config || { echo "::error title=Config check::expected $1"; bad=1; }; }
+          refuse() { if grep -qxF "$1" .config; then echo "::error title=Config check::unexpected $1"; bad=1; fi; }
+          need "CONFIG_LOCALVERSION=\"$localversion\""
+          need "CONFIG_GENERIC_CPU=y"
+          need "CONFIG_X86_64_VERSION=$X86_64_LEVEL"
+          refuse "CONFIG_X86_NATIVE_CPU=y"
+          need "CONFIG_HZ=$HZ"
+          if [ "$CPU_SCHED" = bore ]; then need "CONFIG_SCHED_BORE=y"; else refuse "CONFIG_SCHED_BORE=y"; fi
+          if [ "$DEBUG_INFO" = none ]; then need "CONFIG_DEBUG_INFO_NONE=y"; fi
+          [ "$bad" -eq 0 ] || exit 1
+
+          krel=$(make -s kernelrelease)
+          [ "$krel" = "$VERSION$localversion" ] \
+            || { echo "::error::kernelrelease is $krel, expected $VERSION$localversion"; exit 1; }
+          echo "Building $krel on $(nproc) CPUs"
+          make -j"$(nproc)" KCFLAGS="-mtune=$MTUNE" KBUILD_BUILD_HOST=github-actions \
+            KBUILD_BUILD_USER="cachyos-$TARGET" DPKG_FLAGS=-d bindeb-pkg
+
+          cp .config "/out/config-$krel"
+          cd ..
+          mv ./*.deb /out/
+          cd /out
+          sha256sum ./*.deb > SHA256SUMS
+          ls -lh
+          BUILD
+
+      - name: Build Debian packages
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD/work:/work" -v "$PWD/out:/out" -w /work \
+            -e TAG -e VERSION -e RUN_TAG -e TARGET -e X86_64_LEVEL -e MTUNE -e CPU_SCHED -e HZ \
+            -e CONFIG_SOURCE -e DEBUG_INFO \
+            "$BUILD_IMAGE" bash /work/build.sh
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ needs.resolve.outputs.version }}-cachyos-i3-6100-r${{ github.run_id }}a${{ github.run_attempt }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Summarise
+        shell: bash
+        run: |
+          {
+            echo "### Packages for $TARGET"
+            echo '```'
+            cat out/SHA256SUMS
+            echo '```'
+            echo "Install with: sudo dpkg -i linux-image-*.deb linux-headers-*.deb"
+            echo "Leave linux-libc-dev out unless you mean to replace Devuan's copy."
+          } >> "$GITHUB_STEP_SUMMARY"
