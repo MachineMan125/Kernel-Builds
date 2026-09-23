@@ -1,3 +1,4 @@
+# Revision 11: adds i3-6100 profile (Skylake-S desktop, 2 cores / 4 threads, v7.2.7; same targets as nuc7).
 # Revision 10: MuQSS SCHED_CLASS_EXT hunk rebuilt from the patch itself (anchored only on the config + prompt lines) after 7.2.7 rejected it; pre-build verifies the gate landed; NUC profile moves to v7.2.7.
 # Revision 9: context-tolerant MuQSS SCHED_CLASS_EXT hunk; pre-build fails on rejected hunks or sched_ext + MuQSS.
 # Revision 8: MuQSS v0.31 compatibility shim for 7.2.5+ (missing rt_mutex_futex_* helpers).
@@ -8,6 +9,14 @@
 # Revision 3: adds Project C (PDS / BMQ) scheduler options.
 # Revision 2: read tkg-reference.html for required target configurations.
 # Reviewed upstream pin; full compilation and hardware testing still required.
+#
+# Device profiles (kernel, -march, timer Hz, max logical CPUs):
+#   nuc7     v7.2.7    skylake    500  4   Intel NUC7, active intel_pstate
+#   i3-6100  v7.2.7    skylake    500  4   Core i3-6100 desktop (2C/4T, one L3), active intel_pstate
+#   z220     v6.18.51  ivybridge  500  8   HP Z220
+#   e6410    v6.18.51  westmere   300  4   Dell Latitude E6410 (adds swap / zswap)
+# Recommended defaults for every profile: bore, full preemption, gcc, O2, sched_ext auto, module_trimming none.
+# MuQSS on the 4-thread Skylake profiles: runqueue smt (default); mc is the only other distinct layout there.
 name: Build linux-tkg (Devuan device profiles)
 'on':
   workflow_dispatch:
@@ -19,10 +28,11 @@ name: Build linux-tkg (Devuan device profiles)
         default: nuc7
         options:
         - nuc7
+        - i3-6100
         - z220
         - e6410
       kernel_version:
-        description: 'profile, exact tag (v6.18.51), or series (6.18-latest). Supported: 6.18 / 7.2. MuQSS + profile uses 7.2-latest'
+        description: 'profile, exact tag (v6.18.51), or series (6.18-latest). Supported: 6.18 / 7.2. MuQSS + profile uses 7.2-latest on 6.18 profiles'
         required: true
         default: profile
       cpu_scheduler:
@@ -37,7 +47,7 @@ name: Build linux-tkg (Devuan device profiles)
         - bmq
         - muqss
       muqss_runqueue:
-        description: 'MuQSS only: runqueue sharing. smt = linux-tkg default; mc / mc-llc share per core complex; none = one queue per CPU'
+        description: 'MuQSS only: runqueue sharing. smt = linux-tkg default (recommended on nuc7 / i3-6100); mc / mc-llc share per core complex; none = one queue per CPU'
         required: true
         type: choice
         default: smt
@@ -82,7 +92,7 @@ name: Build linux-tkg (Devuan device profiles)
         - '2'
         - '3'
       timer_freq:
-        description: 'profile: NUC 500, Z220 500, E6410 300 Hz; MuQSS always 100 Hz (-ck default)'
+        description: 'profile: NUC 500, i3-6100 500, Z220 500, E6410 300 Hz; MuQSS always 100 Hz (-ck default)'
         required: true
         type: choice
         default: profile
@@ -94,7 +104,7 @@ name: Build linux-tkg (Devuan device profiles)
         - '500'
         - '1000'
       cpu_governor:
-        description: Default generic governor; NUC active intel_pstate uses its own algorithms
+        description: Default generic governor; NUC and i3-6100 active intel_pstate use their own algorithms
         required: true
         type: choice
         default: schedutil
@@ -115,7 +125,7 @@ name: Build linux-tkg (Devuan device profiles)
         - ivybridge
         - skylake
       nr_cpus:
-        description: 'Maximum logical CPUs; profile: 4 / 8 / 4. Check actual hardware.'
+        description: 'Maximum logical CPUs; profile: NUC 4 / i3-6100 4 / Z220 8 / E6410 4. Check actual hardware.'
         required: true
         type: choice
         default: profile
@@ -176,7 +186,13 @@ jobs:
         python3 - <<'PYCODE'
         import os,re,json,pathlib
         p=pathlib.Path(os.environ['GITHUB_WORKSPACE']); e=os.environ
-        profiles={'nuc7':('v7.2.7','skylake','500','4'),'z220':('v6.18.51','ivybridge','500','8'),'e6410':('v6.18.51','westmere','300','4')}
+        # machine: (kernel, -march, timer Hz, max logical CPUs). Keep names short: they end up in the kernel release.
+        profiles={
+            'nuc7':   ('v7.2.7',  'skylake',  '500','4'),
+            'i3-6100':('v7.2.7',  'skylake',  '500','4'),
+            'z220':   ('v6.18.51','ivybridge','500','8'),
+            'e6410':  ('v6.18.51','westmere', '300','4'),
+        }
         # Kernel series this workflow accepts. Adding one here is only half the job:
         # the pinned linux-tkg must also carry patches for it (checked after cloning).
         series_ok=['6.18','7.2']
@@ -382,6 +398,7 @@ jobs:
         # stays on. Every member is set explicitly here; fragments are merged last, so this decides it.
         if scx: common+=['CONFIG_BPF=y','CONFIG_BPF_SYSCALL=y','CONFIG_BPF_JIT=y','# CONFIG_DEBUG_INFO_NONE is not set','CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y','# CONFIG_DEBUG_INFO_DWARF4 is not set','# CONFIG_DEBUG_INFO_DWARF5 is not set','# CONFIG_DEBUG_INFO_REDUCED is not set','# CONFIG_DEBUG_INFO_SPLIT is not set','CONFIG_DEBUG_INFO_BTF=y','CONFIG_DEBUG_INFO_BTF_MODULES=y','CONFIG_SCHED_CLASS_EXT=y']
         else: common+=['CONFIG_DEBUG_INFO_NONE=y','# CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT is not set','# CONFIG_DEBUG_INFO_DWARF4 is not set','# CONFIG_DEBUG_INFO_DWARF5 is not set']
+        # Per-device extras. The i3-6100 (31 GB RAM, 50 GB swap) and the NUC / Z220 need none.
         if e['BUILD_MACHINE']=='e6410': common+=['CONFIG_SWAP=y','CONFIG_ZSWAP=y','CONFIG_ZSMALLOC=y','CONFIG_CRYPTO_ZSTD=y','CONFIG_CRYPTO_LZ4=y']
         (t/'99-ci.myfrag').write_text('\n'.join(common)+'\n')
         f=pathlib.Path.home()/'.config/frogminer/linux-tkg.cfg'; f.parent.mkdir(parents=True,exist_ok=True)
