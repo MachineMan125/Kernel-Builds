@@ -1,3 +1,7 @@
+# Revision 14: PDS / BMQ get linux-tkg's 500 / 750 Hz timer options. Only 0003-glitched-cfs.patch adds them and linux-tkg
+#   applies it to BORE / EEVDF only; at TKG_REF 7.2 has no glitched PDS / BMQ patch, so 500 Hz fell back to CONFIG_HZ=100.
+#   Its scheduler-neutral kernel/Kconfig.hz sections are now appended to 0009-prjc.patch. MuQSS replaces the timer menu
+#   itself (100 / 250 / 300 / 1000 Hz); requesting 500 / 750 Hz with MuQSS now fails in seconds instead of after patching.
 # Revision 13: Project C (PDS / BMQ) gets the same two 7.2.7 fixes as MuQSS: SCHED_CLASS_EXT hunk rebuilt (0009-prjc.patch
 #   rejected it) and the rt_mutex_futex_* link shim (alt_core.c lacks them too). Both steps now handle all three schedulers.
 # Revision 12: adds optiplex3090 profile (Dell OptiPlex 3090, i5-10500T Comet Lake, 6 cores / 12 threads, v7.2.7); nr_cpus gains 12.
@@ -380,6 +384,41 @@ jobs:
         else:
             f.write_text(new)
             note('replaced SCHED_CLASS_EXT hunk with a config+prompt anchored insertion')
+        PYCODE
+    - name: Add 500 / 750 Hz timer options for PDS / BMQ / MuQSS
+      if: contains(fromJSON('["muqss","pds","bmq"]'), env.BUILD_SCHEDULER)
+      run: |
+        python3 - <<'PYCODE'
+        # linux-tkg's 500 and 750 Hz choices are not in mainline kernel/Kconfig.hz. They come from
+        # 0003-glitched-cfs.patch, which linux-tkg applies to BORE / EEVDF / CFS only; the other schedulers rely on
+        # their own glitched patch (0005-glitched-pds, 0009-glitched-bmq, 0004-glitched-muqss). When that patch is
+        # missing for the series (7.2 at TKG_REF), linux-tkg still enables HZ_500 / HZ_750, the option does not
+        # exist, and Kconfig silently falls back to another frequency (100 Hz was seen). verify-config.py caught it.
+        # The Kconfig.hz sections of 0003-glitched-cfs.patch only add choice entries and are scheduler-neutral,
+        # so they are appended to the scheduler patch, which linux-tkg applies after glitched-base.
+        import os,re,pathlib
+        e=os.environ; p=pathlib.Path(e['GITHUB_WORKSPACE']); d=p/'linux-tkg/linux-tkg-patches'/e['BUILD_SERIES']
+        out=p/'dist/metadata/hz-options.txt'
+        def note(msg,level='notice'):
+            print(f'::{level}::hz-options: {msg}'); out.write_text(msg+'\n')
+        sp,gp={'muqss':('0004-muqss.patch','0004-glitched-muqss.patch'),'pds':('0009-prjc.patch','0005-glitched-pds.patch'),'bmq':('0009-prjc.patch','0009-glitched-bmq.patch')}[e['BUILD_SCHEDULER']]
+        f=d/sp; s=f.read_text()
+        def has500(t): return re.search(r'^\+\s*config HZ_500$',t,re.M) is not None
+        if has500(s): note(f'{sp} already carries the 500 Hz option; nothing to do'); raise SystemExit(0)
+        g=d/gp
+        if g.is_file() and has500(g.read_text()): note(f'{gp} provides the 500 Hz option; nothing to do'); raise SystemExit(0)
+        if 'kernel/Kconfig.hz' in s:
+            # MuQSS rebuilds the timer choice itself (*_NODEF entries, 100 Hz default); merging would clash.
+            # Its own choices (100 / 250 / 300 / 1000) still work, so only fail when 500 / 750 was asked for.
+            if e['BUILD_HZ'] in ('500','750'):
+                note(f"{sp} replaces kernel/Kconfig.hz and has no {e['BUILD_HZ']} Hz option; use timer_freq 100, 250, 300 or 1000 with {e['BUILD_SCHEDULER']}",'error'); raise SystemExit(1)
+            note(f"{sp} provides its own timer options; {e['BUILD_HZ']} Hz is one of them, nothing to do"); raise SystemExit(0)
+        cfs=(d/'0003-glitched-cfs.patch').read_text()
+        secs=[m.group(0) for m in re.finditer(r'^diff --git a/kernel/Kconfig\.hz b/kernel/Kconfig\.hz\n.*?(?=^diff --git |\Z)',cfs,re.M|re.S)]
+        if not secs or not has500(''.join(secs)):
+            note('0003-glitched-cfs.patch no longer adds HZ_500 to kernel/Kconfig.hz; review before updating TKG_REF','error'); raise SystemExit(1)
+        f.write_text(s.rstrip('\n')+'\n'+''.join(sec.rstrip('\n')+'\n' for sec in secs))
+        note(f'appended {len(secs)} kernel/Kconfig.hz section(s) from 0003-glitched-cfs.patch to {sp} (adds 500 / 750 Hz)')
         PYCODE
     - name: Write safely quoted TKG settings and fragments
       run: |
