@@ -1,3 +1,5 @@
+# Revision 13: Project C (PDS / BMQ) gets the same two 7.2.7 fixes as MuQSS: SCHED_CLASS_EXT hunk rebuilt (0009-prjc.patch
+#   rejected it) and the rt_mutex_futex_* link shim (alt_core.c lacks them too). Both steps now handle all three schedulers.
 # Revision 12: adds optiplex3090 profile (Dell OptiPlex 3090, i5-10500T Comet Lake, 6 cores / 12 threads, v7.2.7); nr_cpus gains 12.
 # Revision 11: adds i3-6100 profile (Skylake-S desktop, 2 cores / 4 threads, v7.2.7; same targets as nuc7).
 # Revision 10: MuQSS SCHED_CLASS_EXT hunk rebuilt from the patch itself (anchored only on the config + prompt lines) after 7.2.7 rejected it; pre-build verifies the gate landed; NUC profile moves to v7.2.7.
@@ -306,27 +308,30 @@ jobs:
         fi
         { echo '### Scheduler'; sed 's/^/    /' dist/metadata/scheduler.txt; } >> "$GITHUB_STEP_SUMMARY"
         cat dist/metadata/scheduler.txt
-    - name: Fix MuQSS SCHED_CLASS_EXT Kconfig hunk
-      if: env.BUILD_SCHEDULER == 'muqss'
+    - name: Fix scheduler SCHED_CLASS_EXT Kconfig hunk
+      if: contains(fromJSON('["muqss","pds","bmq"]'), env.BUILD_SCHEDULER)
       run: |
         python3 - <<'PYCODE'
-        # MuQSS v0.31 gates SCHED_CLASS_EXT in kernel/Kconfig.preempt with a hunk that rewrites the entry's
-        # "depends on" line and carries several lines of context around it. Stable updates keep changing the
-        # depends/select lines of that entry (7.2.x added "select GENERIC_ALLOCATOR"; 7.2.7 rejected even the
-        # Revision 9 replacement: "Hunk #3 FAILED at 170"), so linux-tkg stops in prepare.
+        # MuQSS v0.31 and Project C (PDS / BMQ) both gate SCHED_CLASS_EXT in kernel/Kconfig.preempt with a hunk
+        # that rewrites the entry's "depends on" line and carries several lines of context around it. Stable
+        # updates keep changing the depends/select lines of that entry (7.2.x added "select GENERIC_ALLOCATOR";
+        # 7.2.7 rejected MuQSS's Revision 9 replacement with "Hunk #3 FAILED at 170" and 0009-prjc.patch with
+        # "Hunk #2 FAILED at 168"), so linux-tkg stops in prepare.
         # The hunk is now located structurally (whatever its context) and rebuilt as a one-line insertion
         # anchored only on the entry's "config" line and its prompt, which are unchanged since sched_ext landed:
         #      config SCHED_CLASS_EXT
-        #     +	depends on !SCHED_MUQSS
+        #     +	depends on !SCHED_MUQSS            (!SCHED_ALT for PDS / BMQ)
         #      	bool "Extensible Scheduling Class"
         # Kconfig ANDs all "depends on" lines of an entry and attribute order does not matter.
         # verify-config.py later confirms the gate really sits in the SCHED_CLASS_EXT entry.
         import os,re,pathlib
         e=os.environ; p=pathlib.Path(e['GITHUB_WORKSPACE'])
-        f=p/'linux-tkg/linux-tkg-patches'/e['BUILD_SERIES']/'0004-muqss.patch'
-        out=p/'dist/metadata/muqss-kconfig-fix.txt'
+        # scheduler: (patch file, Kconfig symbol the patch adds and gates sched_ext on)
+        pf,gate={'muqss':('0004-muqss.patch','SCHED_MUQSS'),'pds':('0009-prjc.patch','SCHED_ALT'),'bmq':('0009-prjc.patch','SCHED_ALT')}[e['BUILD_SCHEDULER']]
+        f=p/'linux-tkg/linux-tkg-patches'/e['BUILD_SERIES']/pf
+        out=p/'dist/metadata/sched-kconfig-fix.txt'
         def note(msg,level='notice'):
-            print(f'::{level}::muqss-kconfig-fix: {msg}'); out.write_text(msg+'\n')
+            print(f'::{level}::sched-kconfig-fix: {msg}'); out.write_text(msg+'\n')
         def fail(msg):
             note(msg,'error'); raise SystemExit(1)
         src=f.read_text(); lines=src.splitlines(keepends=True)
@@ -352,14 +357,14 @@ jobs:
                 j+=1
             while j<len(lines) and lines[j].startswith('\\'): j+=1
             body=lines[i+1:j]; text=''.join(body)
-            if cur=='b/kernel/Kconfig.preempt' and '!SCHED_MUQSS' in text and 'Extensible Scheduling Class' in text:
+            if cur=='b/kernel/Kconfig.preempt' and '!'+gate in text and 'Extensible Scheduling Class' in text:
                 ol=a
                 for bl in body:
                     if bl.startswith(' ') and prompt in bl: break
                     if bl[:1] in (' ','\n','-'): ol+=1
                 else:
-                    fail(f'SCHED_CLASS_EXT prompt is not a context line in its hunk ({f.name}:{i+1}); review 0004-muqss.patch')
-                res.append(f'@@ -{ol-1},2 +{ol-1+b-a},3 @@\n config SCHED_CLASS_EXT\n+\tdepends on !SCHED_MUQSS\n'+bl)
+                    fail(f'SCHED_CLASS_EXT prompt is not a context line in its hunk ({f.name}:{i+1}); review {pf}')
+                res.append(f'@@ -{ol-1},2 +{ol-1+b-a},3 @@\n config SCHED_CLASS_EXT\n+\tdepends on !{gate}\n'+bl)
                 done+=1
             else:
                 res+=[l]+body
@@ -367,9 +372,9 @@ jobs:
         new=''.join(res)
         if done>1: fail(f'{done} SCHED_CLASS_EXT hunks found in {f.name}; expected one')
         if done==0:
-            # Not fatal here: a newer MuQSS may carry its own fix. verify-config.py still fails the build on any
-            # .rej file, on sched_ext + MuQSS, or on a missing gate.
-            note('SCHED_CLASS_EXT hunk not found; review 0004-muqss.patch before updating TKG_REF','warning')
+            # Not fatal here: a newer MuQSS / Project C may carry its own fix. verify-config.py still fails the
+            # build on any .rej file, on sched_ext with an alternative scheduler, or on a missing gate.
+            note(f'SCHED_CLASS_EXT hunk not found; review {pf} before updating TKG_REF','warning')
         elif new==src:
             note('patch already carries the minimal SCHED_CLASS_EXT hunk; nothing to do')
         else:
@@ -439,23 +444,25 @@ jobs:
         printf '%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}" > dist/metadata/runner.txt
     - name: Install checked pre-build validation hook
       run: |
-        cat > "$GITHUB_WORKSPACE/muqss-compat.py" <<'PYCODE'
-        # Compatibility shim for MuQSS v0.31 (written against 7.2.0) on 7.2.5+ stable kernels.
+        cat > "$GITHUB_WORKSPACE/sched-compat.py" <<'PYCODE'
+        # Compatibility shim for alternative schedulers written against 7.2.0 on 7.2.5+ stable kernels:
+        # MuQSS v0.31 (kernel/sched/MuQSS.c) and Project C PDS / BMQ (kernel/sched/alt_core.c).
         # 7.2.5 made rt_mutex_wait_proxy_lock() call rt_mutex_futex_{pre,post}_schedule(), which mainline
-        # defines in kernel/sched/core.c. MuQSS replaces core.c with MuQSS.c and lacks them, so vmlinux fails
-        # to link. Adds them only when the tree calls them and MuQSS.c does not define them.
+        # defines in kernel/sched/core.c. Both schedulers build their own file instead of core.c and lack them,
+        # so vmlinux fails to link. Adds them only when the tree calls them and the scheduler does not define them.
         import pathlib,re,sys
-        src=pathlib.Path('.'); mq=src/'kernel/sched/MuQSS.c'; api=src/'kernel/locking/rtmutex_api.c'
+        src=pathlib.Path('.'); api=src/'kernel/locking/rtmutex_api.c'
         out=pathlib.Path(sys.argv[1]) if len(sys.argv)>1 else None
         def note(msg):
-            print('muqss-compat:',msg)
+            print('sched-compat:',msg)
             if out: out.write_text(msg+'\n')
-        if not mq.is_file(): note('not a MuQSS tree; nothing to do'); sys.exit(0)
+        mq=next((f for f in (src/'kernel/sched/MuQSS.c',src/'kernel/sched/alt_core.c') if f.is_file()),None)
+        if not mq: note('not a MuQSS / Project C tree; nothing to do'); sys.exit(0)
         s=mq.read_text()
         if 'rt_mutex_futex_post_schedule' not in api.read_text(): note('kernel does not use futex rt_mutex helpers; nothing to do'); sys.exit(0)
-        if re.search(r'^void rt_mutex_futex_post_schedule\(void\)',s,re.M): note('MuQSS already defines futex helpers; nothing to do'); sys.exit(0)
+        if re.search(r'^void rt_mutex_futex_post_schedule\(void\)',s,re.M): note(f'{mq.name} already defines futex helpers; nothing to do'); sys.exit(0)
         m=re.search(r'^void rt_mutex_post_schedule\(void\)\n\{\n.*?^\}\n',s,re.M|re.S)
-        assert m and len(re.findall(r'^void rt_mutex_post_schedule\(void\)',s,re.M))==1, 'MuQSS.c layout changed; review shim'
+        assert m and len(re.findall(r'^void rt_mutex_post_schedule\(void\)',s,re.M))==1, f'{mq.name} layout changed; review shim'
         shim='''
         /*
          * Futex-context variants (added to mainline in 7.2.5 stable). As in mainline they skip
@@ -478,7 +485,7 @@ jobs:
         }
         '''
         mq.write_text(s[:m.end()]+shim+s[m.end():])
-        note('added rt_mutex_futex_pre_schedule/rt_mutex_futex_post_schedule to kernel/sched/MuQSS.c')
+        note(f'added rt_mutex_futex_pre_schedule/rt_mutex_futex_post_schedule to kernel/sched/{mq.name}')
         PYCODE
         cat > "$GITHUB_WORKSPACE/verify-config.py" <<'PYCODE'
         import os,pathlib,re,json,shutil,subprocess,sys
@@ -507,13 +514,14 @@ jobs:
             checks['CONFIG_SCHED_MUQSS']='y'
             checks['CONFIG_RQ_'+e['BUILD_RUNQUEUE'].upper().replace('-','_')]='y'
         elif c.get('CONFIG_SCHED_MUQSS','n')!='n': errors.append('Unexpected MuQSS')
-        # MuQSS replaces the scheduler core sched_ext plugs into; if its Kconfig gate was lost, catch it here.
-        if sched=='muqss' and c.get('CONFIG_SCHED_CLASS_EXT','n')!='n': errors.append('sched_ext enabled with MuQSS; Kconfig gate missing')
+        # MuQSS and Project C replace the scheduler core sched_ext plugs into; if the Kconfig gate was lost, catch it here.
+        gate={'muqss':'SCHED_MUQSS','pds':'SCHED_ALT','bmq':'SCHED_ALT'}.get(sched)
+        if gate and c.get('CONFIG_SCHED_CLASS_EXT','n')!='n': errors.append(f'sched_ext enabled with {sched}; Kconfig gate missing')
         # The rewritten hunk is anchored on very little context, so confirm the gate landed inside the
         # SCHED_CLASS_EXT entry itself rather than anywhere else in the file.
-        if sched=='muqss':
+        if gate:
             blk=re.search(r'^config SCHED_CLASS_EXT\n(.*?)(?=^\S|\Z)',pathlib.Path('kernel/Kconfig.preempt').read_text(),re.M|re.S)
-            if blk and not re.search(r'^\s+depends on[^\n]*!SCHED_MUQSS',blk.group(1),re.M): errors.append('MuQSS gate (depends on !SCHED_MUQSS) missing from SCHED_CLASS_EXT in kernel/Kconfig.preempt')
+            if blk and not re.search(r'^\s+depends on[^\n]*!'+gate,blk.group(1),re.M): errors.append(f'{sched} gate (depends on !{gate}) missing from SCHED_CLASS_EXT in kernel/Kconfig.preempt')
         # patch keeps going after a failed hunk; a .rej file means part of a patch is silently missing.
         rej=sorted(str(r) for r in pathlib.Path('.').rglob('*.rej') if '.git' not in r.parts)
         if rej: errors.append('Rejected patch hunks: '+', '.join(rej))
@@ -536,11 +544,11 @@ jobs:
         p=Path('linux-tkg/install.sh'); s=p.read_text()
         needle='    time make ${llvm_opt} -j ${_thread_num} bindeb-pkg LOCALVERSION=-${_kernel_flavor}'
         assert s.count(needle)==1, 'Upstream build hook changed; review before updating pin'
-        s=s.replace(needle,'    python3 "$GITHUB_WORKSPACE/muqss-compat.py" "$GITHUB_WORKSPACE/dist/metadata/muqss-compat.txt" || exit 1\n    python3 "$GITHUB_WORKSPACE/verify-config.py" "$_kernel_flavor" || exit 1\n'+needle)
+        s=s.replace(needle,'    python3 "$GITHUB_WORKSPACE/sched-compat.py" "$GITHUB_WORKSPACE/dist/metadata/sched-compat.txt" || exit 1\n    python3 "$GITHUB_WORKSPACE/verify-config.py" "$_kernel_flavor" || exit 1\n'+needle)
         p.write_text(s)
         PYCODE
         git -C linux-tkg diff -- install.sh > dist/metadata/ci-hook.patch
-        cp verify-config.py muqss-compat.py dist/metadata/
+        cp verify-config.py sched-compat.py dist/metadata/
     - name: Build kernel packages
       working-directory: linux-tkg
       timeout-minutes: 320
