@@ -1,3 +1,4 @@
+# Revision 12: adds optiplex3090 profile (Dell OptiPlex 3090, i5-10500T Comet Lake, 6 cores / 12 threads, v7.2.7); nr_cpus gains 12.
 # Revision 11: adds i3-6100 profile (Skylake-S desktop, 2 cores / 4 threads, v7.2.7; same targets as nuc7).
 # Revision 10: MuQSS SCHED_CLASS_EXT hunk rebuilt from the patch itself (anchored only on the config + prompt lines) after 7.2.7 rejected it; pre-build verifies the gate landed; NUC profile moves to v7.2.7.
 # Revision 9: context-tolerant MuQSS SCHED_CLASS_EXT hunk; pre-build fails on rejected hunks or sched_ext + MuQSS.
@@ -11,12 +12,15 @@
 # Reviewed upstream pin; full compilation and hardware testing still required.
 #
 # Device profiles (kernel, -march, timer Hz, max logical CPUs):
-#   nuc7     v7.2.7    skylake    500  4   Intel NUC7, active intel_pstate
-#   i3-6100  v7.2.7    skylake    500  4   Core i3-6100 desktop (2C/4T, one L3), active intel_pstate
-#   z220     v6.18.51  ivybridge  500  8   HP Z220
-#   e6410    v6.18.51  westmere   300  4   Dell Latitude E6410 (adds swap / zswap)
+#   nuc7          v7.2.7    skylake    500  4   Intel NUC7, active intel_pstate
+#   i3-6100       v7.2.7    skylake    500  4   Core i3-6100 desktop (2C/4T, one L3), active intel_pstate
+#   optiplex3090  v7.2.7    skylake    500  12  Dell OptiPlex 3090 (i5-10500T Comet Lake, 6C/12T, one L3), active intel_pstate
+#   z220          v6.18.51  ivybridge  500  8   HP Z220
+#   e6410         v6.18.51  westmere   300  4   Dell Latitude E6410 (adds swap / zswap)
 # Recommended defaults for every profile: bore, full preemption, gcc, O2, sched_ext auto, module_trimming none.
 # MuQSS on the 4-thread Skylake profiles: runqueue smt (default); mc is the only other distinct layout there.
+# MuQSS on optiplex3090: smt (default) = 6 queues, one per core; none = 12 queues; mc and wider = one queue
+# for all 12 threads (single die, single L3, so mc / mc-llc / smp / all behave the same).
 name: Build linux-tkg (Devuan device profiles)
 'on':
   workflow_dispatch:
@@ -29,6 +33,7 @@ name: Build linux-tkg (Devuan device profiles)
         options:
         - nuc7
         - i3-6100
+        - optiplex3090
         - z220
         - e6410
       kernel_version:
@@ -47,7 +52,7 @@ name: Build linux-tkg (Devuan device profiles)
         - bmq
         - muqss
       muqss_runqueue:
-        description: 'MuQSS only: runqueue sharing. smt = linux-tkg default (recommended on nuc7 / i3-6100); mc / mc-llc share per core complex; none = one queue per CPU'
+        description: 'MuQSS only: runqueue sharing. smt = linux-tkg default (recommended on nuc7 / i3-6100 / optiplex3090); mc / mc-llc share per core complex; none = one queue per CPU'
         required: true
         type: choice
         default: smt
@@ -92,7 +97,7 @@ name: Build linux-tkg (Devuan device profiles)
         - '2'
         - '3'
       timer_freq:
-        description: 'profile: NUC 500, i3-6100 500, Z220 500, E6410 300 Hz; MuQSS always 100 Hz (-ck default)'
+        description: 'profile: NUC 500, i3-6100 500, OptiPlex 3090 500, Z220 500, E6410 300 Hz; MuQSS always 100 Hz (-ck default)'
         required: true
         type: choice
         default: profile
@@ -104,7 +109,7 @@ name: Build linux-tkg (Devuan device profiles)
         - '500'
         - '1000'
       cpu_governor:
-        description: Default generic governor; NUC and i3-6100 active intel_pstate use their own algorithms
+        description: Default generic governor; NUC, i3-6100 and OptiPlex 3090 active intel_pstate use their own algorithms
         required: true
         type: choice
         default: schedutil
@@ -125,7 +130,7 @@ name: Build linux-tkg (Devuan device profiles)
         - ivybridge
         - skylake
       nr_cpus:
-        description: 'Maximum logical CPUs; profile: NUC 4 / i3-6100 4 / Z220 8 / E6410 4. Check actual hardware.'
+        description: 'Maximum logical CPUs; profile: NUC 4 / i3-6100 4 / OptiPlex 3090 12 / Z220 8 / E6410 4. Check actual hardware.'
         required: true
         type: choice
         default: profile
@@ -133,6 +138,7 @@ name: Build linux-tkg (Devuan device profiles)
         - profile
         - '4'
         - '8'
+        - '12'
       module_trimming:
         description: Optional per-device modules/<machine>.db; keep none for initial builds
         required: true
@@ -187,11 +193,13 @@ jobs:
         import os,re,json,pathlib
         p=pathlib.Path(os.environ['GITHUB_WORKSPACE']); e=os.environ
         # machine: (kernel, -march, timer Hz, max logical CPUs). Keep names short: they end up in the kernel release.
+        # Comet Lake (i5-10500T) is a Skylake-derived core; GCC has no separate cometlake target.
         profiles={
-            'nuc7':   ('v7.2.7',  'skylake',  '500','4'),
-            'i3-6100':('v7.2.7',  'skylake',  '500','4'),
-            'z220':   ('v6.18.51','ivybridge','500','8'),
-            'e6410':  ('v6.18.51','westmere', '300','4'),
+            'nuc7':        ('v7.2.7',  'skylake',  '500','4'),
+            'i3-6100':     ('v7.2.7',  'skylake',  '500','4'),
+            'optiplex3090':('v7.2.7',  'skylake',  '500','12'),
+            'z220':        ('v6.18.51','ivybridge','500','8'),
+            'e6410':       ('v6.18.51','westmere', '300','4'),
         }
         # Kernel series this workflow accepts. Adding one here is only half the job:
         # the pinned linux-tkg must also carry patches for it (checked after cloning).
@@ -216,7 +224,7 @@ jobs:
         if e['TIMER_FREQ']=='profile': h='100' if e['CPU_SCHEDULER']=='muqss' else h
         else: h=e['TIMER_FREQ']
         assert h in ['100','250','300','500','1000']
-        n=n if e['NR_CPUS']=='profile' else e['NR_CPUS']; assert n in ['4','8']
+        n=n if e['NR_CPUS']=='profile' else e['NR_CPUS']; assert n in ['4','8','12']
         assert e['PREEMPTION']!='rt' or e['CPU_SCHEDULER']=='eevdf', 'RT requires EEVDF (linux-tkg offers no alternative schedulers with PREEMPT_RT)'
         assert e['SCHED_EXT']!='require' or e['CPU_SCHEDULER'] in ('bore','eevdf'), 'sched_ext only works with BORE or EEVDF; PDS, BMQ and MuQSS replace the scheduler core it plugs into'
         rq=e['MUQSS_RUNQUEUE'] if e['CPU_SCHEDULER']=='muqss' else 'n/a'
@@ -398,7 +406,8 @@ jobs:
         # stays on. Every member is set explicitly here; fragments are merged last, so this decides it.
         if scx: common+=['CONFIG_BPF=y','CONFIG_BPF_SYSCALL=y','CONFIG_BPF_JIT=y','# CONFIG_DEBUG_INFO_NONE is not set','CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y','# CONFIG_DEBUG_INFO_DWARF4 is not set','# CONFIG_DEBUG_INFO_DWARF5 is not set','# CONFIG_DEBUG_INFO_REDUCED is not set','# CONFIG_DEBUG_INFO_SPLIT is not set','CONFIG_DEBUG_INFO_BTF=y','CONFIG_DEBUG_INFO_BTF_MODULES=y','CONFIG_SCHED_CLASS_EXT=y']
         else: common+=['CONFIG_DEBUG_INFO_NONE=y','# CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT is not set','# CONFIG_DEBUG_INFO_DWARF4 is not set','# CONFIG_DEBUG_INFO_DWARF5 is not set']
-        # Per-device extras. The i3-6100 (31 GB RAM, 50 GB swap) and the NUC / Z220 need none.
+        # Per-device extras. The i3-6100 (31 GB RAM, 50 GB swap), the OptiPlex 3090 (31 GB RAM, 36 GB swap)
+        # and the NUC / Z220 need none.
         if e['BUILD_MACHINE']=='e6410': common+=['CONFIG_SWAP=y','CONFIG_ZSWAP=y','CONFIG_ZSMALLOC=y','CONFIG_CRYPTO_ZSTD=y','CONFIG_CRYPTO_LZ4=y']
         (t/'99-ci.myfrag').write_text('\n'.join(common)+'\n')
         f=pathlib.Path.home()/'.config/frogminer/linux-tkg.cfg'; f.parent.mkdir(parents=True,exist_ok=True)
