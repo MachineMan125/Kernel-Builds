@@ -1,0 +1,499 @@
+# Upload to .github/workflows/build-zen-kernel.yml.
+# One workflow, every device: pick the machine from the dropdown. Output: .deb packages for Devuan 6 (excalibur).
+#
+# Source: zen-kernel/zen-kernel stable tags (vX.Y.Z-zenN). Resolved afresh on every run; tag + commit SHA are
+# frozen per run and recorded in the summary and build records. Annotated tags are peeled to their commit.
+#
+# What differs from the CachyOS / linux-tkg workflows (checked against v7.2.7-zen1):
+#   * Zen has no LTS branch. 6.18 tags stop at 6.18.13, so every profile builds the 7.x series.
+#   * No BORE. Schedulers are EEVDF (mainline) or Project C PDS / BMQ, which Zen ships built in.
+#   * Timer choices are mainline only: 100 / 250 / 300 / 1000 Hz (no 500 / 750 Hz).
+#   * No per-CPU -march Kconfig entries (only "native" or generic x86-64), so the target CPU is passed as
+#     KCFLAGS="-march=... -mtune=..." and the effective compiler flags are verified before building.
+#   * CONFIG_ZEN_INTERACTIVE (Zen's responsiveness tunables) is exposed as an input.
+#
+# Device profiles (-march, timer Hz, max logical CPUs):
+#   nuc7          skylake    1000  4   Intel NUC7 (i5-7300U Kaby Lake)
+#   i3-6100       skylake    1000  4   Core i3-6100 desktop (needs configs/i3-6100.config - not in repo yet)
+#   optiplex3090  skylake    1000  12  Dell OptiPlex 3090 (i5-10500T Comet Lake)
+#   z220          ivybridge  1000  8   HP Z220 (use sandybridge or x86-64-v2 if it has a Sandy Bridge CPU)
+#   e6410         westmere   300   4   Dell Latitude E6410 (adds swap / zswap, ACPI cpufreq)
+#
+# Build: GCC in a debian:trixie container (matches Devuan 6's compiler for DKMS), O2, no debug info, no LTO,
+# no Rust. Keep a known-working kernel installed; Secure Boot signing/enrollment is a separate task.
+name: Build Zen kernel (Devuan device profiles)
+'on':
+  workflow_dispatch:
+    inputs:
+      machine:
+        description: Device profile; requires configs/<machine>.config in this repository
+        required: true
+        type: choice
+        default: nuc7
+        options:
+        - nuc7
+        - i3-6100
+        - optiplex3090
+        - z220
+        - e6410
+      kernel_version:
+        description: 'latest (default), a series (7.2-latest), a version (7.2.7 = its newest zenN), or an exact tag (v7.2.7-zen1)'
+        required: true
+        type: string
+        default: latest
+      cpu_scheduler:
+        description: 'EEVDF = mainline scheduler with Zen tunables; PDS / BMQ = Project C (built into Zen; disables PSI and sched_ext). RT requires EEVDF.'
+        required: true
+        type: choice
+        default: eevdf
+        options:
+        - eevdf
+        - pds
+        - bmq
+      preemption:
+        description: Full desktop preemption, or experimental real-time
+        required: true
+        type: choice
+        default: full
+        options:
+        - full
+        - rt
+      zen_interactive:
+        description: CONFIG_ZEN_INTERACTIVE (bfq/kyber I/O defaults, lower scheduler granularity, eager ondemand)
+        required: true
+        type: choice
+        default: 'on'
+        options:
+        - 'on'
+        - 'off'
+      timer_freq:
+        description: 'profile: E6410 300 Hz, others 1000 Hz. Zen only offers 100 / 250 / 300 / 1000.'
+        required: true
+        type: choice
+        default: profile
+        options:
+        - profile
+        - '100'
+        - '250'
+        - '300'
+        - '1000'
+      cpu_governor:
+        description: Default cpufreq governor (active intel_pstate on the Skylake-class machines uses its own)
+        required: true
+        type: choice
+        default: schedutil
+        options:
+        - schedutil
+        - ondemand
+        - performance
+      cpu_arch:
+        description: 'profile, or an explicit target; checked against the machine so it cannot produce an unbootable kernel'
+        required: true
+        type: choice
+        default: profile
+        options:
+        - profile
+        - x86-64
+        - x86-64-v2
+        - x86-64-v3
+        - westmere
+        - sandybridge
+        - ivybridge
+        - skylake
+      nr_cpus:
+        description: 'Maximum logical CPUs; profile: NUC 4 / i3-6100 4 / OptiPlex 3090 12 / Z220 8 / E6410 4'
+        required: true
+        type: choice
+        default: profile
+        options:
+        - profile
+        - '4'
+        - '8'
+        - '12'
+      module_trimming:
+        description: Optional per-device modules/<machine>.db (modprobed-db list); keep none for initial builds
+        required: true
+        type: choice
+        default: none
+        options:
+        - none
+        - modprobed-db
+      build_label:
+        description: Optional lowercase label, max 8 characters, e.g. test1. Run ID is appended.
+        required: false
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.machine }}
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+env:
+  ZEN_REPO: https://github.com/zen-kernel/zen-kernel.git
+  BUILD_IMAGE: debian:trixie
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+    - name: Checkout private repository
+      uses: actions/checkout@v5
+      with:
+        persist-credentials: false
+
+    - name: Resolve profile and validate inputs
+      env:
+        MACHINE: ${{ inputs.machine }}
+        CPU_SCHEDULER: ${{ inputs.cpu_scheduler }}
+        PREEMPTION: ${{ inputs.preemption }}
+        ZEN_INTERACTIVE: ${{ inputs.zen_interactive }}
+        TIMER_FREQ: ${{ inputs.timer_freq }}
+        CPU_GOVERNOR: ${{ inputs.cpu_governor }}
+        CPU_ARCH: ${{ inputs.cpu_arch }}
+        NR_CPUS: ${{ inputs.nr_cpus }}
+        MODULE_TRIMMING: ${{ inputs.module_trimming }}
+        BUILD_LABEL: ${{ inputs.build_label }}
+      run: |
+        python3 - <<'PYCODE'
+        import os,re,json,pathlib
+        e=os.environ; p=pathlib.Path(e['GITHUB_WORKSPACE'])
+        def fail(msg): raise SystemExit('::error title=Invalid input::'+msg)
+        # machine: (-march, timer Hz, max logical CPUs, CPU class). Keep names short: they end up in the kernel release.
+        # Comet Lake and Kaby Lake are Skylake-derived cores; GCC has no separate targets for them.
+        profiles={
+            'nuc7':        ('skylake',  '1000','4', 'skylake'),
+            'i3-6100':     ('skylake',  '1000','4', 'skylake'),
+            'optiplex3090':('skylake',  '1000','12','skylake'),
+            'z220':        ('ivybridge','1000','8', 'sandybridge'),
+            'e6410':       ('westmere', '300', '4', 'westmere'),
+        }
+        # Targets each CPU class can boot. v3 needs AVX2 (Haswell+), so only the Skylake-class machines get it.
+        compatible={
+            'westmere':   ['x86-64','x86-64-v2','westmere'],
+            'sandybridge':['x86-64','x86-64-v2','westmere','sandybridge','ivybridge'],
+            'skylake':    ['x86-64','x86-64-v2','x86-64-v3','westmere','sandybridge','ivybridge','skylake'],
+        }
+        m=e['MACHINE']
+        if m not in profiles: fail('Unknown machine '+m)
+        arch,hz,nr,cls=profiles[m]
+        for name,allowed in {'CPU_SCHEDULER':['eevdf','pds','bmq'],'PREEMPTION':['full','rt'],'ZEN_INTERACTIVE':['on','off'],
+                             'CPU_GOVERNOR':['schedutil','ondemand','performance'],'MODULE_TRIMMING':['none','modprobed-db']}.items():
+            if e[name] not in allowed: fail(f'Invalid {name}: {e[name]}')
+        if e['CPU_ARCH']!='profile': arch=e['CPU_ARCH']
+        if arch not in compatible[cls]: fail(f'-march={arch} will not boot on {m} ({cls}-class CPU). Allowed: '+', '.join(compatible[cls]))
+        if m=='z220' and arch=='ivybridge':
+            print('::notice::z220 targets ivybridge. If this Z220 has a Sandy Bridge CPU (E3-12x0 v1, i3/i5/i7-2xxx), rerun with cpu_arch sandybridge or x86-64-v2.')
+        if e['TIMER_FREQ']!='profile': hz=e['TIMER_FREQ']
+        if hz not in ('100','250','300','1000'): fail(f'{hz} Hz is not offered by the Zen kernel')
+        if e['NR_CPUS']!='profile': nr=e['NR_CPUS']
+        if nr not in ('4','8','12'): fail('Invalid NR_CPUS')
+        if e['PREEMPTION']=='rt' and e['CPU_SCHEDULER']!='eevdf': fail('PREEMPT_RT requires EEVDF; Project C (PDS / BMQ) is not combined with RT here')
+        label=e['BUILD_LABEL']
+        if label and not re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,7}',label): fail('build_label: lowercase letters, digits, . and -, max 8 characters')
+        c=p/'configs'/f'{m}.config'
+        if not c.is_file(): fail(f'Missing configs/{m}.config: on the {m}, copy /boot/config-$(uname -r) to configs/{m}.config and commit it')
+        s=c.read_text().splitlines()
+        for item in ('CONFIG_X86_64=y','CONFIG_MODULES=y','CONFIG_BLK_DEV_INITRD=y'):
+            if item not in s: fail(f'configs/{m}.config is missing {item}; expected an x86-64 modular Devuan kernel config')
+        head=next((l for l in s[:6] if l.startswith('# Linux/x86')),'')
+        mv=re.search(r'Linux/x86 (\d+)\.(\d+)',head)
+        if mv and (int(mv[1]),int(mv[2]))<(7,0):
+            print(f'::notice::configs/{m}.config comes from a {mv[1]}.{mv[2]} kernel; olddefconfig will take upstream defaults for every newer option. Check config-diff.txt in the build records.')
+        if e['MODULE_TRIMMING']=='modprobed-db':
+            db=p/'modules'/f'{m}.db'
+            if not (db.is_file() and db.stat().st_size): fail(f'Missing or empty modules/{m}.db')
+        tune='generic' if arch.startswith('x86-64') else arch
+        suffix=f"{m}-{e['CPU_SCHEDULER']}"+('-rt' if e['PREEMPTION']=='rt' else '')+(('-'+label) if label else '')+f"-r{e['GITHUB_RUN_ID']}a{e['GITHUB_RUN_ATTEMPT']}"
+        resolved={'MACHINE':m,'ARCH':arch,'TUNE':tune,'HZ':hz,'NR':nr,'SCHEDULER':e['CPU_SCHEDULER'],'PREEMPTION':e['PREEMPTION'],
+                  'ZEN_INTERACTIVE':e['ZEN_INTERACTIVE'],'GOVERNOR':e['CPU_GOVERNOR'],'TRIMMING':e['MODULE_TRIMMING'],'SUFFIX':suffix}
+        (p/'dist/metadata').mkdir(parents=True,exist_ok=True)
+        (p/'dist/metadata/profile.json').write_text(json.dumps(resolved,indent=2)+'\n')
+        with open(e['GITHUB_ENV'],'a') as f:
+            for k,v in resolved.items(): f.write('BUILD_'+k+'='+v+'\n')
+        print(json.dumps(resolved,indent=2))
+        PYCODE
+
+    - name: Resolve requested Zen release
+      env:
+        VERSION_INPUT: ${{ inputs.kernel_version }}
+      run: |
+        python3 - <<'PYCODE'
+        import os,re,json,pathlib,subprocess
+        MIN_SERIES=(7,0)   # Zen stopped 6.18 at 6.18.13; the device configs are 7.x-era.
+        def parse_request(r):
+            r=r.strip()
+            if r=='latest': return 'latest',None
+            m=re.fullmatch(r'(\d+)\.(\d+)-latest',r)
+            if m: return 'series',tuple(map(int,m.groups()))
+            m=re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)',r)
+            if m: return 'version',tuple(map(int,m.groups()))
+            m=re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)-zen(\d+)',r)
+            if m: return 'exact',tuple(map(int,m.groups()))
+            raise SystemExit('::error::kernel_version: use latest, 7.2-latest, 7.2.7 or v7.2.7-zen1')
+        def select(kind,want,listing):
+            refs={}
+            for line in listing.splitlines():
+                parts=line.split()
+                if len(parts)==2 and re.fullmatch(r'[0-9a-f]{40}',parts[0]): refs[parts[1]]=parts[0]
+            found=[]
+            for ref,sha in refs.items():
+                m=re.fullmatch(r'refs/tags/v(\d+)\.(\d+)\.(\d+)-zen(\d+)',ref)
+                if not m: continue   # skips lqx, peeled ^{} entries and old naming schemes
+                n=tuple(map(int,m.groups()))
+                if n[:2]<MIN_SERIES: continue
+                if kind=='series' and n[:2]!=want: continue
+                if kind=='version' and n[:3]!=want: continue
+                if kind=='exact' and n!=want: continue
+                found.append((n,ref,refs.get(ref+'^{}',sha)))
+            if not found:
+                raise SystemExit(f'::error::No Zen stable tag matches {os.environ["VERSION_INPUT"]!r} (series {MIN_SERIES[0]}.{MIN_SERIES[1]} or newer)')
+            n,ref,commit=max(found)
+            return {'requested':os.environ['VERSION_INPUT'],'tag':ref.removeprefix('refs/tags/'),'commit':commit,
+                    'kernel_version':'.'.join(map(str,n[:3])),'zen_revision':str(n[3])}
+        e=os.environ
+        kind,want=parse_request(e['VERSION_INPUT'])   # validated before touching the network
+        if want and want[:2]<MIN_SERIES: raise SystemExit('::error::Zen has no maintained 6.x series; use 7.x')
+        r=subprocess.run(['git','ls-remote','--tags',e['ZEN_REPO'],'refs/tags/v*-zen*'],check=True,text=True,capture_output=True,timeout=120)
+        res=select(kind,want,r.stdout)
+        out=pathlib.Path('dist/metadata'); out.mkdir(parents=True,exist_ok=True)
+        (out/'resolved-source.json').write_text(json.dumps(res,indent=2)+'\n')
+        with open(e['GITHUB_ENV'],'a') as f:
+            f.write(f"ZEN_TAG={res['tag']}\nZEN_COMMIT={res['commit']}\nZEN_KERNELVERSION={res['kernel_version']}-zen{res['zen_revision']}\n")
+        with open(e['GITHUB_STEP_SUMMARY'],'a') as f:
+            f.write(f"### Selected Zen source\n\n| Machine | Request | Tag | Commit |\n|---|---|---|---|\n| {e['BUILD_MACHINE']} | `{res['requested']}` | `{res['tag']}` | `{res['commit']}` |\n")
+        print(json.dumps(res,indent=2))
+        PYCODE
+
+    - name: Free disk space on the runner
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/lib/android /usr/local/.ghcup /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
+        df -h /
+        available_kb=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')
+        (( available_kb >= 30 * 1024 * 1024 )) || { echo '::error::Need at least 30 GiB free before fetching kernel sources.'; exit 1; }
+
+    - name: Fetch resolved Zen source and device inputs
+      run: |
+        mkdir -p work
+        git init -q work/linux
+        git -C work/linux remote add origin "$ZEN_REPO"
+        git -C work/linux fetch -q --depth 1 origin "refs/tags/$ZEN_TAG:refs/tags/$ZEN_TAG"
+        git -C work/linux checkout -q --detach FETCH_HEAD
+        [[ "$(git -C work/linux rev-parse HEAD)" == "$ZEN_COMMIT" ]] \
+          || { echo '::error::Tag moved after resolution. Start a new run to resolve it again.'; exit 1; }
+        git -C work/linux log -1 --format=fuller > dist/metadata/source.txt
+        version=$(make -s -C work/linux kernelversion)
+        [[ "$version" == "$ZEN_KERNELVERSION" ]] \
+          || { echo "::error::Source reports $version, expected $ZEN_KERNELVERSION"; exit 1; }
+        echo "KBUILD_BUILD_TIMESTAMP=$(git -C work/linux show -s --format=%cD HEAD)" >> "$GITHUB_ENV"
+        cp "configs/$BUILD_MACHINE.config" work/base.config
+        cp work/base.config dist/metadata/base.config
+        # Optional Kconfig fragment, same convention as the linux-tkg workflow.
+        if [ -f "configs/$BUILD_MACHINE.myfrag" ]; then cp "configs/$BUILD_MACHINE.myfrag" work/device.myfrag; cp work/device.myfrag dist/metadata/; fi
+        if [ "$BUILD_TRIMMING" = modprobed-db ]; then
+          # localmodconfig wants lsmod output; modprobed-db stores one module name per line.
+          { echo 'Module                  Size  Used by'; grep -E '^[A-Za-z0-9_-]+$' "modules/$BUILD_MACHINE.db" | sed 's/$/ 0 0/'; } > work/lsmod.txt
+          cp work/lsmod.txt dist/metadata/lsmod.txt
+        fi
+
+    - name: Write build scripts
+      run: |
+        # Every value is shell-quoted into one env file for the container.
+        python3 - <<'PYCODE'
+        import os,shlex
+        keys=[k for k in os.environ if k.startswith(('BUILD_','ZEN_'))]+['KBUILD_BUILD_TIMESTAMP','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT']
+        with open('work/build.env','w') as f:
+            for k in sorted(set(keys)): f.write(f'export {k}={shlex.quote(os.environ[k])}\n')
+        PYCODE
+
+        cat > work/configure.py <<'PYCODE'
+        # Applies the requested settings on top of the device config. Runs inside the kernel tree.
+        import os,re,json,pathlib,subprocess
+        e=os.environ; sched=e['BUILD_SCHEDULER']; alt=sched in ('pds','bmq')
+        want={
+          # MAXSMP (set in stock Debian configs such as optiplex3090's) forces NR_CPUS=8192 and overrides the profile.
+          'X86_64':'y','SMP':'y','MAXSMP':'n','NR_CPUS':e['BUILD_NR'],'X86_NATIVE_CPU':'n',
+          'ZEN_INTERACTIVE':'y' if e['BUILD_ZEN_INTERACTIVE']=='on' else 'n',
+          'CC_OPTIMIZE_FOR_PERFORMANCE':'y','CC_OPTIMIZE_FOR_SIZE':'n',
+          'LTO_NONE':'y','LTO_CLANG_FULL':'n','LTO_CLANG_THIN':'n','RUST':'n',
+          'NO_HZ_IDLE':'y','NO_HZ_FULL':'n','HZ_PERIODIC':'n',
+          'MODULES':'y','BLK_DEV_INITRD':'y','DEVTMPFS':'y','DEVTMPFS_MOUNT':'y','EFI_PARTITION':'y',
+          'LOCALVERSION_AUTO':'n','CMDLINE_BOOL':'n','CMDLINE_OVERRIDE':'n',
+          'MODULE_SIG_FORCE':'n',
+          'DEBUG_INFO_NONE':'y','DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT':'n','DEBUG_INFO_DWARF4':'n','DEBUG_INFO_DWARF5':'n',
+          'DEBUG_INFO_BTF':'n','DEBUG_INFO_BTF_MODULES':'n','SCHED_CLASS_EXT':'n',
+          'CPU_FREQ':'y','CPU_FREQ_GOV_'+e['BUILD_GOVERNOR'].upper():'y',
+        }
+        # Scheduler: Project C is a menuconfig with a PDS / BMQ choice inside it.
+        if alt: want.update(SCHED_ALT='y',SCHED_PDS='y' if sched=='pds' else 'n',SCHED_BMQ='y' if sched=='bmq' else 'n',PSI='n')
+        else:   want.update(SCHED_ALT='n',PSI='y',PSI_DEFAULT_DISABLED='n')
+        # Preemption model.
+        if e['BUILD_PREEMPTION']=='rt': want.update(EXPERT='y',PREEMPT_RT='y',PREEMPT='n',PREEMPT_DYNAMIC='n',PREEMPT_LAZY='n',PREEMPT_NONE='n',PREEMPT_VOLUNTARY='n')
+        else: want.update(PREEMPT='y',PREEMPT_DYNAMIC='y',PREEMPT_RT='n',PREEMPT_LAZY='n',PREEMPT_NONE='n',PREEMPT_VOLUNTARY='n')
+        # Default governor is a choice: clear every member, then set one.
+        for g in ('PERFORMANCE','POWERSAVE','USERSPACE','ONDEMAND','CONSERVATIVE','SCHEDUTIL'):
+            want['CPU_FREQ_DEFAULT_GOV_'+g]='y' if g==e['BUILD_GOVERNOR'].upper() else 'n'
+        # Timer: select through the source-defined choice; never write the derived HZ value.
+        hz=re.findall(r'^\s*config (HZ_\d+)\s*$',pathlib.Path('kernel/Kconfig.hz').read_text(),re.M)
+        if 'HZ_'+e['BUILD_HZ'] not in hz: raise SystemExit(f"::error::{e['BUILD_HZ']} Hz is not offered by this tree ({', '.join(hz)})")
+        for s in hz: want[s]='y' if s=='HZ_'+e['BUILD_HZ'] else 'n'
+        # Per-device extras (same as the CachyOS / linux-tkg E6410 builds).
+        if e['BUILD_MACHINE']=='e6410':
+            want.update(SWAP='y',ZSWAP='y',ZSMALLOC='y',CRYPTO_ZSTD='y',CRYPTO_LZ4='y',X86_INTEL_PSTATE='y',ACPI_PROCESSOR='y',X86_ACPI_CPUFREQ='y')
+        strings={'LOCALVERSION':'-'+e['BUILD_SUFFIX'],'CMDLINE':'','SYSTEM_TRUSTED_KEYS':'','SYSTEM_REVOCATION_KEYS':'','MODULE_SIG_KEY':'certs/signing_key.pem'}
+        for k,v in want.items():
+            args=['--enable',k] if v=='y' else ['--disable',k] if v=='n' else ['--module',k] if v=='m' else ['--set-val',k,v]
+            subprocess.run(['scripts/config',*args],check=True)
+        for k,v in strings.items(): subprocess.run(['scripts/config','--set-str',k,v],check=True)
+        pathlib.Path('/dist/metadata/requested-config.json').write_text(json.dumps({'options':want,'strings':strings},indent=2)+'\n')
+        PYCODE
+
+        cat > work/verify.py <<'PYCODE'
+        # Fails the run before the long compile if the final .config or compiler target is not what was asked for.
+        import os,re,pathlib,subprocess,shlex
+        e=os.environ; sched=e['BUILD_SCHEDULER']
+        c=dict(re.findall(r'^(CONFIG_\w+)=(.*)$',pathlib.Path('.config').read_text(),re.M))
+        need={'X86_64':'y','SMP':'y','MODULES':'y','BLK_DEV_INITRD':'y','DEVTMPFS':'y','NO_HZ_IDLE':'y',
+              'NR_CPUS':e['BUILD_NR'],'HZ':e['BUILD_HZ'],'DEBUG_INFO_NONE':'y','CC_OPTIMIZE_FOR_PERFORMANCE':'y',
+              'CPU_FREQ_DEFAULT_GOV_'+e['BUILD_GOVERNOR'].upper():'y','LOCALVERSION':'"-'+e['BUILD_SUFFIX']+'"'}
+        off=['X86_NATIVE_CPU','LOCALVERSION_AUTO','RUST','DEBUG_INFO_BTF','SCHED_CLASS_EXT','NO_HZ_FULL','MODULE_SIG_FORCE',
+             'LTO_CLANG_FULL','LTO_CLANG_THIN','CMDLINE_BOOL']
+        if e['BUILD_ZEN_INTERACTIVE']=='on': need['ZEN_INTERACTIVE']='y'
+        else: off.append('ZEN_INTERACTIVE')
+        if sched=='eevdf': off.append('SCHED_ALT')
+        else:
+            need.update(SCHED_ALT='y',**{'SCHED_'+sched.upper():'y'}); off+=['SCHED_'+('BMQ' if sched=='pds' else 'PDS'),'PSI']
+        if e['BUILD_PREEMPTION']=='rt': need['PREEMPT_RT']='y'; off.append('PREEMPT')
+        else: need.update(PREEMPT='y',PREEMPT_DYNAMIC='y'); off.append('PREEMPT_RT')
+        if e['BUILD_MACHINE']=='e6410': need.update(SWAP='y',ZSWAP='y',ZSMALLOC='y',X86_ACPI_CPUFREQ='y')
+        errors=[f'{k}: expected {v}, got {c.get("CONFIG_"+k,"unset")}' for k,v in need.items() if c.get('CONFIG_'+k)!=v]
+        errors+=[f'{k} unexpectedly enabled' for k in off if c.get('CONFIG_'+k,'n') not in ('n','')]
+        if c.get('CONFIG_CMDLINE','""')!='""': errors.append('Unexpected built-in command line')
+        release=subprocess.check_output(['make','-s','kernelrelease'],text=True).strip()
+        expected=e['ZEN_KERNELVERSION']+'-'+e['BUILD_SUFFIX']
+        if release!=expected: errors.append(f'kernelrelease is {release}, expected {expected}')
+        if len(release)>64: errors.append('Kernel release exceeds 64 characters; shorten build_label')
+        # KCFLAGS is appended after arch/x86/Makefile's "-march=x86-64 -mtune=generic", so the last -march must be ours.
+        flags=shlex.split(subprocess.check_output(['make','-s','--eval=print-ci-flags:;@echo $(KBUILD_CFLAGS)','print-ci-flags'],text=True,stderr=subprocess.DEVNULL))
+        march=[f for f in flags if f.startswith('-march=')]; mtune=[f for f in flags if f.startswith('-mtune=')]
+        if not march or march[-1]!='-march='+e['BUILD_ARCH']: errors.append(f'Effective compiler target is {march[-1:]}, expected -march={e["BUILD_ARCH"]}')
+        if not mtune or mtune[-1]!='-mtune='+e['BUILD_TUNE']: errors.append(f'Effective tuning is {mtune[-1:]}, expected -mtune={e["BUILD_TUNE"]}')
+        pathlib.Path('/dist/metadata/compiler-flags.txt').write_text(' '.join(flags)+'\n')
+        pathlib.Path('/dist/metadata/kernel-release.txt').write_text(release+'\n')
+        msg='\n'.join(errors) if errors else 'Requested configuration checks passed. Hardware testing still required.'
+        pathlib.Path('/dist/metadata/validation.txt').write_text(msg+'\n')
+        if errors: raise SystemExit('::error title=Config check::'+'; '.join(errors))
+        print('Pre-build checks passed:',release,march[-1],mtune[-1])
+        PYCODE
+
+        cat > work/collect.py <<'PYCODE'
+        # Keeps only the matching image + headers; writes checksums and install notes.
+        import os,pathlib,subprocess,shutil,hashlib,json
+        e=os.environ; d=pathlib.Path('/dist'); release=(d/'metadata/kernel-release.txt').read_text().strip()
+        want={'linux-image-'+release,'linux-headers-'+release}; found=set(); rows=[]
+        for f in sorted(pathlib.Path('/work').glob('*.deb')):
+            info={k:subprocess.check_output(['dpkg-deb','-f',str(f),k],text=True).strip() for k in ('Package','Architecture','Version')}
+            rows.append({'file':f.name,**info})
+            if info['Package'] in want:
+                if info['Architecture']!='amd64': raise SystemExit('Unexpected architecture '+info['Architecture'])
+                shutil.copyfile(f,d/'packages'/f.name); found.add(info['Package'])
+        (d/'metadata/packages.json').write_text(json.dumps(rows,indent=2)+'\n')
+        if found!=want: raise SystemExit('Missing expected packages: '+', '.join(sorted(want-found)))
+        pk=d/'packages'
+        (pk/'SHA256SUMS').write_text(''.join(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+f.name+'\n' for f in sorted(pk.glob('*.deb'))))
+        extra={'e6410':'Optional zswap needs active disk-backed swap (swapon --show); test zswap.enabled=1 zswap.compressor=zstd in GRUB.\nDo not add intel_pstate parameters.\n',
+               'z220':'intel_pstate=passive is an optional explicit choice for schedutil.\n'}.get(e['BUILD_MACHINE'],'')
+        (pk/'INSTALL.txt').write_text(f"""Zen kernel for {e['BUILD_MACHINE']}: {release}
+        Source: {e['ZEN_TAG']} ({e['ZEN_COMMIT']})
+        Scheduler {e['BUILD_SCHEDULER']}, preemption {e['BUILD_PREEMPTION']}, {e['BUILD_HZ']} Hz, -march={e['BUILD_ARCH']}, ZEN_INTERACTIVE {e['BUILD_ZEN_INTERACTIVE']}
+
+        On the {e['BUILD_MACHINE']}, extract into a separate folder and run:
+          sha256sum -c SHA256SUMS
+          sudo apt install ./linux-image-*.deb ./linux-headers-*.deb
+        Resolve any DKMS errors, check that the matching initramfs exists, run sudo update-grub,
+        and confirm both the new and the previous kernels are in the boot menu.
+        Keep the known-working kernel installed. If Secure Boot is enabled, arrange signing
+        and enrollment before booting this build; CI does none.
+        {extra}Diagnostics are in the separate build-records artifact.
+        """)
+        print('Collected:',', '.join(sorted(found)))
+        PYCODE
+
+        cat > work/build.sh <<'BUILD'
+        set -euo pipefail
+        source /work/build.env
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends \
+          build-essential bc bison flex gawk cpio kmod rsync zstd xz-utils lz4 python3 perl \
+          libelf-dev libssl-dev openssl libdw-dev dwarves debhelper dpkg-dev fakeroot ca-certificates >/dev/null
+        { gcc --version; ld --version; dpkg-query -W gcc binutils libc6-dev dpkg-dev; } > /dist/metadata/toolchain.txt
+        head -n1 /dist/metadata/toolchain.txt
+
+        cd /work/linux
+        git config --global --add safe.directory /work/linux
+        export KCFLAGS="-march=$BUILD_ARCH -mtune=$BUILD_TUNE"
+        export KBUILD_BUILD_HOST=github-actions KBUILD_BUILD_USER="zen-$BUILD_MACHINE"
+        # Set-but-empty stops scripts/setlocalversion from appending "+" to the release; CONFIG_LOCALVERSION carries the suffix.
+        export LOCALVERSION=
+
+        cp ../base.config .config
+        make -s olddefconfig < /dev/null 2>&1 | tee /dist/metadata/configure-initial.log
+        if [ -f ../device.myfrag ]; then scripts/kconfig/merge_config.sh -m -O . .config ../device.myfrag; fi
+        if [ -f ../lsmod.txt ]; then (yes '' || true) | make -s LSMOD=../lsmod.txt localmodconfig; fi
+        python3 ../configure.py
+        make -s olddefconfig < /dev/null 2>&1 | tee /dist/metadata/configure-final.log
+        make -s syncconfig    # refresh include/config so kernelrelease reflects the final .config
+        cp .config /dist/metadata/final.config
+        scripts/diffconfig ../base.config .config > /dist/metadata/config-diff.txt || true
+        python3 ../verify.py
+
+        jobs=$(( $(nproc) ))
+        echo "Building $(make -s kernelrelease) with $jobs jobs, KCFLAGS=$KCFLAGS"
+        make -j"$jobs" DPKG_FLAGS=-d bindeb-pkg < /dev/null 2>&1 | tee /dist/metadata/build.log
+        mkdir -p /dist/packages
+        python3 ../collect.py
+        BUILD
+
+    - name: Configure, verify and build in Debian trixie
+      timeout-minutes: 320
+      run: |
+        mkdir -p dist/packages
+        docker run --rm -v "$PWD/work:/work" -v "$PWD/dist:/dist" -w /work "$BUILD_IMAGE" bash /work/build.sh
+        {
+          echo '### Packages built'
+          echo '```'
+          cat dist/packages/SHA256SUMS
+          echo '```'
+          echo "Kernel: \`$(cat dist/metadata/kernel-release.txt)\`"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Preserve diagnostics
+      if: always()
+      run: |
+        sudo chown -R "$(id -u):$(id -g)" dist work 2>/dev/null || true
+        mkdir -p dist/metadata
+        df -h / > dist/metadata/disk.txt
+        if [ -f work/linux/.config ]; then cp work/linux/.config dist/metadata/final.config; fi
+        if [ -f dist/metadata/build.log ]; then tail -n 200 dist/metadata/build.log > dist/metadata/build-tail.log; fi
+
+    - name: Upload packages
+      uses: actions/upload-artifact@v6
+      with:
+        name: linux-zen-${{ env.BUILD_SUFFIX }}
+        path: dist/packages/
+        if-no-files-found: error
+        retention-days: 30
+        compression-level: 0
+
+    - name: Upload build records even on failure
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: linux-zen-records-${{ inputs.machine }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: dist/metadata/
+        if-no-files-found: warn
+        retention-days: 30
