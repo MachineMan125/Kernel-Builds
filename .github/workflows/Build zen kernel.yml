@@ -429,7 +429,7 @@ jobs:
         apt-get update -qq
         apt-get install -y -qq --no-install-recommends \
           build-essential bc bison flex gawk cpio kmod rsync zstd xz-utils lz4 python3 perl \
-          libelf-dev libssl-dev openssl libdw-dev dwarves debhelper dpkg-dev fakeroot ca-certificates >/dev/null
+          libelf-dev libssl-dev openssl libdw-dev dwarves debhelper dpkg-dev fakeroot ca-certificates git >/dev/null
         { gcc --version; ld --version; dpkg-query -W gcc binutils libc6-dev dpkg-dev; } > /dist/metadata/toolchain.txt
         head -n1 /dist/metadata/toolchain.txt
 
