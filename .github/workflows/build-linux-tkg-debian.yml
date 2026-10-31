@@ -1,30 +1,10 @@
-
-Skip to content
-
-    MachineMan125
-    Kernel-Builds
-
-Repository navigation
-
-    Code
-    Issues
-    Pull requests
-    Agents
-    Actions
-    Projects
-    Wiki
-    Security and quality
-    Insights
-    Settings
-
-Build linux-tkg (Devuan device profiles)
-Build linux-tkg (Devuan device profiles) #68
-
-    All jobs
-    Run details
-
-Workflow file for this run
-.github/workflows/build-linux-tkg-debian.yml at e06b387
+# Revision 15: Linux 7.3 support. series_ok gains 7.3 and the three Skylake-family profiles move to v7.3.1. TKG_REF moves
+#   from the 7.3-rc2-era pin (2026-09-12) to 6227ce3 (2026-10-31): the old pin's 7.3 MuQSS patch rejects 4 hunks in
+#   kernel/workqueue.c on 7.3.1 and it had no Project C (0009-prjc.patch) for 7.3 at all. The new pin's install.sh
+#   wraps the bindeb-pkg line in a pipefail subshell with "|& tee", which broke the exact-string hook injection; the
+#   hook is now located with a regex. On 7.3, MuQSS (v0.32) no longer replaces kernel/Kconfig.hz, so 500 / 750 Hz work
+#   with it; MuQSS + profile on 6.18 profiles now moves to the newest supported series. The z220 / e6410 profiles move
+#   from v6.18.51 to v6.18.60: the new pin's 6.18 0009-prjc.patch rejects a kernel/exit.c hunk on 6.18.51 (BORE is fine).
 # Revision 14: PDS / BMQ get linux-tkg's 500 / 750 Hz timer options. Only 0003-glitched-cfs.patch adds them and linux-tkg
 #   applies it to BORE / EEVDF only; at TKG_REF 7.2 has no glitched PDS / BMQ patch, so 500 Hz fell back to CONFIG_HZ=100.
 #   Its scheduler-neutral kernel/Kconfig.hz sections are now appended to 0009-prjc.patch. MuQSS replaces the timer menu
@@ -45,11 +25,11 @@ Workflow file for this run
 # Reviewed upstream pin; full compilation and hardware testing still required.
 #
 # Device profiles (kernel, -march, timer Hz, max logical CPUs):
-#   nuc7          v7.2.7    skylake    500  4   Intel NUC7, active intel_pstate
-#   i3-6100       v7.2.7    skylake    500  4   Core i3-6100 desktop (2C/4T, one L3), active intel_pstate
-#   optiplex3090  v7.2.7    skylake    500  12  Dell OptiPlex 3090 (i5-10500T Comet Lake, 6C/12T, one L3), active intel_pstate
-#   z220          v6.18.51  ivybridge  500  8   HP Z220
-#   e6410         v6.18.51  westmere   300  4   Dell Latitude E6410 (adds swap / zswap)
+#   nuc7          v7.3.1    skylake    500  4   Intel NUC7, active intel_pstate
+#   i3-6100       v7.3.1    skylake    500  4   Core i3-6100 desktop (2C/4T, one L3), active intel_pstate
+#   optiplex3090  v7.3.1    skylake    500  12  Dell OptiPlex 3090 (i5-10500T Comet Lake, 6C/12T, one L3), active intel_pstate
+#   z220          v6.18.60  ivybridge  500  8   HP Z220
+#   e6410         v6.18.60  westmere   300  4   Dell Latitude E6410 (adds swap / zswap)
 # Recommended defaults for every profile: bore, full preemption, gcc, O2, sched_ext auto, module_trimming none.
 # MuQSS on the 4-thread Skylake profiles: runqueue smt (default); mc is the only other distinct layout there.
 # MuQSS on optiplex3090: smt (default) = 6 queues, one per core; none = 12 queues; mc and wider = one queue
@@ -70,11 +50,11 @@ name: Build linux-tkg (Devuan device profiles)
         - z220
         - e6410
       kernel_version:
-        description: 'profile, exact tag (v6.18.51), or series (6.18-latest). Supported: 6.18 / 7.2. MuQSS + profile uses 7.2-latest on 6.18 profiles'
+        description: 'profile, exact tag (v6.18.60), or series (6.18-latest). Supported: 6.18 / 7.2 / 7.3. MuQSS + profile uses 7.3-latest on 6.18 profiles'
         required: true
         default: profile
       cpu_scheduler:
-        description: 'BORE baseline; EEVDF comparison; PDS / BMQ = Project C; MuQSS = Con Kolivas -ck (7.2 only here). PDS/BMQ/MuQSS disable PSI and sched_ext. RT requires EEVDF.'
+        description: 'BORE baseline; EEVDF comparison; PDS / BMQ = Project C; MuQSS = Con Kolivas -ck (7.2 / 7.3 only here). PDS/BMQ/MuQSS disable PSI and sched_ext. RT requires EEVDF.'
         required: true
         type: choice
         default: bore
@@ -130,7 +110,7 @@ name: Build linux-tkg (Devuan device profiles)
         - '2'
         - '3'
       timer_freq:
-        description: 'profile: NUC 500, i3-6100 500, OptiPlex 3090 500, Z220 500, E6410 300 Hz; MuQSS always 100 Hz (-ck default)'
+        description: 'profile: NUC 500, i3-6100 500, OptiPlex 3090 500, Z220 500, E6410 300 Hz; MuQSS profile = 100 Hz (-ck default); MuQSS on 7.2 has no 500 / 750 Hz'
         required: true
         type: choice
         default: profile
@@ -193,7 +173,7 @@ defaults:
   run:
     shell: bash -euo pipefail {0}
 env:
-  TKG_REF: 7e98360cfadd8d7f6da829da07ce11bd4646e006
+  TKG_REF: 6227ce308da890087da4a9d1d38d1b71dba7eb27
   TKG_REPO: https://github.com/Frogging-Family/linux-tkg.git
   CCACHE_DIR: ${{ github.workspace }}/.ccache
 jobs:
@@ -228,15 +208,15 @@ jobs:
         # machine: (kernel, -march, timer Hz, max logical CPUs). Keep names short: they end up in the kernel release.
         # Comet Lake (i5-10500T) is a Skylake-derived core; GCC has no separate cometlake target.
         profiles={
-            'nuc7':        ('v7.2.7',  'skylake',  '500','4'),
-            'i3-6100':     ('v7.2.7',  'skylake',  '500','4'),
-            'optiplex3090':('v7.2.7',  'skylake',  '500','12'),
-            'z220':        ('v6.18.51','ivybridge','500','8'),
-            'e6410':       ('v6.18.51','westmere', '300','4'),
+            'nuc7':        ('v7.3.1',  'skylake',  '500','4'),
+            'i3-6100':     ('v7.3.1',  'skylake',  '500','4'),
+            'optiplex3090':('v7.3.1',  'skylake',  '500','12'),
+            'z220':        ('v6.18.60','ivybridge','500','8'),
+            'e6410':       ('v6.18.60','westmere', '300','4'),
         }
         # Kernel series this workflow accepts. Adding one here is only half the job:
         # the pinned linux-tkg must also carry patches for it (checked after cloning).
-        series_ok=['6.18','7.2']
+        series_ok=['6.18','7.2','7.3']
         m=e['MACHINE']; assert m in profiles, 'Unknown machine'
         v,a,h,n=profiles[m]
         for name,allowed in {'CPU_SCHEDULER':['bore','eevdf','pds','bmq','muqss'],'MUQSS_RUNQUEUE':['smt','none','mc','mc-llc','smp','all'],'SCHED_EXT':['auto','require'],'PREEMPTION':['full','rt'],'COMPILER':['gcc','llvm'],'OPT_LEVEL':['1','2','3'],'CPU_GOVERNOR':['schedutil','ondemand','performance'],'MODULE_TRIMMING':['none','modprobed-db']}.items():
@@ -244,8 +224,9 @@ jobs:
         # MuQSS only exists for 7.1+. With kernel_version=profile, move 6.18 profiles to the newest
         # supported series instead of failing. An explicitly typed version is left alone.
         if e['KERNEL_VERSION']=='profile' and e['CPU_SCHEDULER']=='muqss' and not v.startswith('v7.'):
-            print(f'::notice::MuQSS needs Linux 7.1 or newer; {m} profile kernel {v} replaced with 7.2-latest')
-            v='7.2-latest'
+            newest=max(series_ok,key=lambda x:tuple(map(int,x.split('.'))))
+            print(f'::notice::MuQSS needs Linux 7.1 or newer; {m} profile kernel {v} replaced with {newest}-latest')
+            v=newest+'-latest'
         v=v if e['KERNEL_VERSION']=='profile' else e['KERNEL_VERSION']
         sre='|'.join(re.escape(s) for s in series_ok)
         assert re.fullmatch(r'(?:v?(?:'+sre+r')\.[0-9]+|(?:'+sre+r')-latest)',v), 'Use a supported stable tag or series: '+', '.join(series_ok)
@@ -343,11 +324,11 @@ jobs:
       if: contains(fromJSON('["muqss","pds","bmq"]'), env.BUILD_SCHEDULER)
       run: |
         python3 - <<'PYCODE'
-        # MuQSS v0.31 and Project C (PDS / BMQ) both gate SCHED_CLASS_EXT in kernel/Kconfig.preempt with a hunk
+        # MuQSS (v0.31 on 7.2, v0.32 on 7.3) and Project C (PDS / BMQ) both gate SCHED_CLASS_EXT in kernel/Kconfig.preempt with a hunk
         # that rewrites the entry's "depends on" line and carries several lines of context around it. Stable
         # updates keep changing the depends/select lines of that entry (7.2.x added "select GENERIC_ALLOCATOR";
         # 7.2.7 rejected MuQSS's Revision 9 replacement with "Hunk #3 FAILED at 170" and 0009-prjc.patch with
-        # "Hunk #2 FAILED at 168"), so linux-tkg stops in prepare.
+        # "Hunk #2 FAILED at 168"), so linux-tkg stops in prepare. Still needed and verified on 7.3.1 at TKG_REF.
         # The hunk is now located structurally (whatever its context) and rebuilt as a one-line insertion
         # anchored only on the entry's "config" line and its prompt, which are unchanged since sched_ext landed:
         #      config SCHED_CLASS_EXT
@@ -419,7 +400,7 @@ jobs:
         # linux-tkg's 500 and 750 Hz choices are not in mainline kernel/Kconfig.hz. They come from
         # 0003-glitched-cfs.patch, which linux-tkg applies to BORE / EEVDF / CFS only; the other schedulers rely on
         # their own glitched patch (0005-glitched-pds, 0009-glitched-bmq, 0004-glitched-muqss). When that patch is
-        # missing for the series (7.2 at TKG_REF), linux-tkg still enables HZ_500 / HZ_750, the option does not
+        # missing for the series (7.2 and 7.3 at TKG_REF), linux-tkg still enables HZ_500 / HZ_750, the option does not
         # exist, and Kconfig silently falls back to another frequency (100 Hz was seen). verify-config.py caught it.
         # The Kconfig.hz sections of 0003-glitched-cfs.patch only add choice entries and are scheduler-neutral,
         # so they are appended to the scheduler patch, which linux-tkg applies after glitched-base.
@@ -516,6 +497,7 @@ jobs:
         # 7.2.5 made rt_mutex_wait_proxy_lock() call rt_mutex_futex_{pre,post}_schedule(), which mainline
         # defines in kernel/sched/core.c. Both schedulers build their own file instead of core.c and lack them,
         # so vmlinux fails to link. Adds them only when the tree calls them and the scheduler does not define them.
+        # The 7.3 MuQSS and Project C patches define them already, so on 7.3 this reports "nothing to do".
         import pathlib,re,sys
         src=pathlib.Path('.'); api=src/'kernel/locking/rtmutex_api.c'
         out=pathlib.Path(sys.argv[1]) if len(sys.argv)>1 else None
@@ -607,9 +589,16 @@ jobs:
         python3 - <<'PYCODE'
         from pathlib import Path
         p=Path('linux-tkg/install.sh'); s=p.read_text()
-        needle='    time make ${llvm_opt} -j ${_thread_num} bindeb-pkg LOCALVERSION=-${_kernel_flavor}'
-        assert s.count(needle)==1, 'Upstream build hook changed; review before updating pin'
-        s=s.replace(needle,'    python3 "$GITHUB_WORKSPACE/sched-compat.py" "$GITHUB_WORKSPACE/dist/metadata/sched-compat.txt" || exit 1\n    python3 "$GITHUB_WORKSPACE/verify-config.py" "$_kernel_flavor" || exit 1\n'+needle)
+        import re
+        # Match the Debian bindeb-pkg line whatever its indentation, "time" prefix or trailing "|& tee ...".
+        # linux-tkg runs it inside a "( set -o pipefail; ... )" subshell; "exit 1" there leaves the subshell and
+        # install.sh's own "set -e" then stops the build.
+        rx=re.compile(r'^([ \t]*)(?:time[ \t]+)?make[ \t][^\n]*\bbindeb-pkg[ \t]+LOCALVERSION=-\$\{_kernel_flavor\}[^\n]*$',re.M)
+        hits=rx.findall(s)
+        assert len(hits)==1, f'Expected one bindeb-pkg build line in install.sh, found {len(hits)}; review before updating pin'
+        hook=('python3 "$GITHUB_WORKSPACE/sched-compat.py" "$GITHUB_WORKSPACE/dist/metadata/sched-compat.txt" || exit 1',
+              'python3 "$GITHUB_WORKSPACE/verify-config.py" "$_kernel_flavor" || exit 1')
+        s=rx.sub(lambda m:''.join(m.group(1)+h+'\n' for h in hook)+m.group(0),s,count=1)
         p.write_text(s)
         PYCODE
         git -C linux-tkg diff -- install.sh > dist/metadata/ci-hook.patch
