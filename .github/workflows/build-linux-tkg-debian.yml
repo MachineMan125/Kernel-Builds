@@ -1,3 +1,30 @@
+
+Skip to content
+
+    MachineMan125
+    Kernel-Builds
+
+Repository navigation
+
+    Code
+    Issues
+    Pull requests
+    Agents
+    Actions
+    Projects
+    Wiki
+    Security and quality
+    Insights
+    Settings
+
+Build linux-tkg (Devuan device profiles)
+Build linux-tkg (Devuan device profiles) #68
+
+    All jobs
+    Run details
+
+Workflow file for this run
+.github/workflows/build-linux-tkg-debian.yml at e06b387
 # Revision 14: PDS / BMQ get linux-tkg's 500 / 750 Hz timer options. Only 0003-glitched-cfs.patch adds them and linux-tkg
 #   applies it to BORE / EEVDF only; at TKG_REF 7.2 has no glitched PDS / BMQ patch, so 500 Hz fell back to CONFIG_HZ=100.
 #   Its scheduler-neutral kernel/Kconfig.hz sections are now appended to 0009-prjc.patch. MuQSS replaces the timer menu
@@ -515,7 +542,6 @@ jobs:
         \tlockdep_assert(!fetch_and_set(current->sched_rt_mutex, 1));
         #endif
         }
-
         void rt_mutex_futex_post_schedule(void)
         {
         #ifdef CONFIG_RT_MUTEXES
