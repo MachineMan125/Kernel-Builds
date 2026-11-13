@@ -1,3 +1,110 @@
+Claude
+Created 5 files, shared 6 files, ran 2 commands
+
+All five Ironwood files are patched and attached, plus a zip that keeps the repository layout. Nothing has been through a real Firefox build: I checked that the YAML parses, the scripts pass a syntax check, and make-deb.sh builds a correct package from a mock tarball, including its error paths.
+What changed
+
+    Workflow
+        Pipefail is on for every step and inputs go through env:.
+        The version is validated in resolve.
+        build uses !cancelled() instead of always().
+        Step timeouts sit below the 6-hour limit.
+        Publishing moved to a separate release job, the only one with write access.
+        A new step test-installs the .deb in a Debian trixie container.
+    Setup action
+        A CPU check runs first.
+        More disk is freed.
+        The swap file goes on /mnt when that disk exists.
+        xauth is installed explicitly.
+        The toolchain cache no longer accumulates old versions.
+    mozconfig
+        Debug symbols are off in the final build.
+        Strip options are set per stage.
+        sccache is skipped in the profile-use stage.
+    prepare-source.sh
+        The silent-abort bug in the branding rename is fixed.
+        Patches that apply with fuzz produce a warning.
+        A build record is written.
+    make-deb.sh
+        The silent-abort bug in the tarball lookup is fixed.
+        The Debian revision is the run number.
+        policies.json is a conffile in /etc/ironwood.
+        prerm handles deconfigure.
+        SHA256SUMS is written.
+
+Things to know before the first run
+
+    Action versions. I used the versions your kernel workflow already runs (checkout@v5, cache@v5, upload-artifact@v6) plus download-artifact@v7. Newer majors exist for all four, but I haven’t checked their breaking changes.
+    The first run starts with a cold toolchain cache. Dropping restore-keys means each new Firefox version downloads its toolchains once.
+    The install test is new and unproven. It runs after the artifact upload, so a false failure won’t cost you the .deb, but it will block the release job until fixed.
+    Step timeouts are my estimates. I set 280 minutes for the instrumented build and 300 for the final one. Adjust them if your real build times are close to those.
+    Skipping sccache in the final stage is a judgment call. One line in the mozconfig re-enables it if the stats show it was helping.
+    Package versions now look like 140.5.0~esr-42. Betas get a ~ too, so they sort before the release.
+
+Not done
+
+    Signature checking. Verifying SHA512SUMS.asc needs Mozilla’s release key stored in your repository.
+    policies.json. I didn’t have the file, so I couldn’t add DisableTelemetry and DisableFirefoxStudies. The package description now says only what the build guarantees.
+    The kernel workflow. Its fixes from the first review are not applied. Tell me if you want that file patched as well.
+
+Ironwood patched
+ZIP
+Build ironwood
+YML
+Action
+YML
+mozconfig
+Prepare source
+SH
+Make deb
+SH
+
+What about the Kernel Build YAML?
+Shared a file, ran a command
+
+The kernel workflow is now patched as Revision 16 and attached as build-linux-tkg.yml. It has not been through a real build: I checked that the YAML parses, all eight embedded Python blocks compile, and the validation step gives the intended result on ten sample inputs. A default build should produce the same kernel as Revision 15.
+What changed
+
+    sched_ext: auto is renamed off. auto never enabled sched_ext, so behaviour is unchanged, but anything that passes auto by name will now be rejected.
+    cpu_arch newer than the profile CPU is rejected. For example, skylake on e6410 fails in the first step with a clear message.
+    750 Hz is selectable. The Hz step already handled it; it still fails quickly with MuQSS on 7.2.
+    The compiler cache survives failed builds. It is restored at the start and saved in a separate step that runs even on failure, and its size goes from 2G to 4G.
+    Rejected hunks are kept. Any *.rej files are copied into the build records, with a warning.
+    linux-libc-dev is no longer uploaded. It is still listed in packages.tsv.
+    Queued builds for different schedulers no longer cancel each other. The concurrency group is now machine plus scheduler.
+    Smaller fixes.
+        The “no series has this patch” error can now print.
+        A missing SCHED_CLASS_EXT entry fails verification.
+        A bare v7.3 is accepted.
+        An nr_cpus below the profile’s produces a warning.
+        Runs get a descriptive name and a resolved-build summary.
+
+Things to know
+
+    Same-scheduler queueing is unchanged. Three queued builds for the same machine and scheduler will still drop the middle one.
+    A bare v7.3 is untested against linux-tkg. The workflow accepts it, but I haven’t confirmed linux-tkg does.
+    4G caches fill the quota faster. Each run saves a new cache entry, and GitHub evicts the oldest once the repository passes 10 GB.
+
+Not done
+
+    Early release-length check. I don’t know exactly how linux-tkg builds the flavour string, so the 64-character check still happens before the build starts, not in the first step.
+    Hz-step hardening. Tightening how it detects that MuQSS replaces the timer menu needs a look at the actual 7.3 patch.
+    Matching the target toolchain. Building in a Devuan or Debian container is a larger change that deserves its own revision.
+
+Build linux tkg
+YML
+
+
+Claude is AI and can make mistakes.
+Build linux tkg · YML
+# Revision 16: review fixes, no change to what a default build produces. sched_ext "auto" is renamed "off": the CI fragment
+#   forces DEBUG_INFO_NONE, SCHED_CLASS_EXT needs BTF, so "auto" never enabled it. cpu_arch newer than the profile CPU is
+#   rejected (it would not boot). timer_freq gains 750 (already handled by the Hz step). The compiler cache is now saved after
+#   failed builds too and grows to 4G. Rejected hunks (*.rej) are kept in the build records. linux-libc-dev is listed but no
+#   longer uploaded (installing it would replace Devuan's userspace kernel headers). verify-config.py fails when the
+#   SCHED_CLASS_EXT entry cannot be found. The "no series has this patch" message can now print (pipefail used to end the
+#   step first). Concurrency is per machine + scheduler, so queued builds for different schedulers no longer cancel each
+#   other. A bare series tag (v7.3) is accepted for the first release of a series. run-name and a resolved-build summary added.
 # Revision 15: Linux 7.3 support. series_ok gains 7.3 and the three Skylake-family profiles move to v7.3.1. TKG_REF moves
 #   from the 7.3-rc2-era pin (2026-09-12) to 6227ce3 (2026-10-31): the old pin's 7.3 MuQSS patch rejects 4 hunks in
 #   kernel/workqueue.c on 7.3.1 and it had no Project C (0009-prjc.patch) for 7.3 at all. The new pin's install.sh
@@ -30,11 +137,12 @@
 #   optiplex3090  v7.3.1    skylake    500  12  Dell OptiPlex 3090 (i5-10500T Comet Lake, 6C/12T, one L3), active intel_pstate
 #   z220          v6.18.60  ivybridge  500  8   HP Z220
 #   e6410         v6.18.60  westmere   300  4   Dell Latitude E6410 (adds swap / zswap)
-# Recommended defaults for every profile: bore, full preemption, gcc, O2, sched_ext auto, module_trimming none.
+# Recommended defaults for every profile: bore, full preemption, gcc, O2, sched_ext off, module_trimming none.
 # MuQSS on the 4-thread Skylake profiles: runqueue smt (default); mc is the only other distinct layout there.
 # MuQSS on optiplex3090: smt (default) = 6 queues, one per core; none = 12 queues; mc and wider = one queue
 # for all 12 threads (single die, single L3, so mc / mc-llc / smp / all behave the same).
 name: Build linux-tkg (Devuan device profiles)
+run-name: "${{ inputs.machine }} / ${{ inputs.kernel_version }} / ${{ inputs.cpu_scheduler }}${{ inputs.build_label && format(' / {0}', inputs.build_label) || '' }}"
 'on':
   workflow_dispatch:
     inputs:
@@ -50,7 +158,7 @@ name: Build linux-tkg (Devuan device profiles)
         - z220
         - e6410
       kernel_version:
-        description: 'profile, exact tag (v6.18.60), or series (6.18-latest). Supported: 6.18 / 7.2 / 7.3. MuQSS + profile uses 7.3-latest on 6.18 profiles'
+        description: 'profile, exact tag (v6.18.60, or v7.3 for a .0 release), or series (6.18-latest). Supported: 6.18 / 7.2 / 7.3. MuQSS + profile uses 7.3-latest on 6.18 profiles'
         required: true
         default: profile
       cpu_scheduler:
@@ -77,12 +185,12 @@ name: Build linux-tkg (Devuan device profiles)
         - smp
         - all
       sched_ext:
-        description: 'BORE / EEVDF only. auto = whatever the config ends up with; require = build BTF and guarantee sched_ext for scx_* schedulers (bigger, slower build)'
+        description: 'BORE / EEVDF only. off = no sched_ext (no BTF, no debug info); require = build BTF and guarantee sched_ext for scx_* schedulers (bigger, slower build)'
         required: true
         type: choice
-        default: auto
+        default: 'off'
         options:
-        - auto
+        - 'off'
         - require
       preemption:
         description: Full desktop preemption, or experimental real-time
@@ -120,6 +228,7 @@ name: Build linux-tkg (Devuan device profiles)
         - '250'
         - '300'
         - '500'
+        - '750'
         - '1000'
       cpu_governor:
         description: Default generic governor; NUC, i3-6100 and OptiPlex 3090 active intel_pstate use their own algorithms
@@ -131,7 +240,7 @@ name: Build linux-tkg (Devuan device profiles)
         - ondemand
         - performance
       cpu_arch:
-        description: profile, or explicit compatible target; never targets the runner
+        description: profile, or an explicit target no newer than the profile CPU; never targets the runner
         required: true
         type: choice
         default: profile
@@ -167,7 +276,7 @@ name: Build linux-tkg (Devuan device profiles)
 permissions:
   contents: read
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.machine }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.machine }}-${{ inputs.cpu_scheduler }}
   cancel-in-progress: false
 defaults:
   run:
@@ -219,7 +328,7 @@ jobs:
         series_ok=['6.18','7.2','7.3']
         m=e['MACHINE']; assert m in profiles, 'Unknown machine'
         v,a,h,n=profiles[m]
-        for name,allowed in {'CPU_SCHEDULER':['bore','eevdf','pds','bmq','muqss'],'MUQSS_RUNQUEUE':['smt','none','mc','mc-llc','smp','all'],'SCHED_EXT':['auto','require'],'PREEMPTION':['full','rt'],'COMPILER':['gcc','llvm'],'OPT_LEVEL':['1','2','3'],'CPU_GOVERNOR':['schedutil','ondemand','performance'],'MODULE_TRIMMING':['none','modprobed-db']}.items():
+        for name,allowed in {'CPU_SCHEDULER':['bore','eevdf','pds','bmq','muqss'],'MUQSS_RUNQUEUE':['smt','none','mc','mc-llc','smp','all'],'SCHED_EXT':['off','require'],'PREEMPTION':['full','rt'],'COMPILER':['gcc','llvm'],'OPT_LEVEL':['1','2','3'],'CPU_GOVERNOR':['schedutil','ondemand','performance'],'MODULE_TRIMMING':['none','modprobed-db']}.items():
             assert e[name] in allowed, 'Invalid '+name
         # MuQSS only exists for 7.1+. With kernel_version=profile, move 6.18 profiles to the newest
         # supported series instead of failing. An explicitly typed version is left alone.
@@ -229,16 +338,22 @@ jobs:
             v=newest+'-latest'
         v=v if e['KERNEL_VERSION']=='profile' else e['KERNEL_VERSION']
         sre='|'.join(re.escape(s) for s in series_ok)
-        assert re.fullmatch(r'(?:v?(?:'+sre+r')\.[0-9]+|(?:'+sre+r')-latest)',v), 'Use a supported stable tag or series: '+', '.join(series_ok)
+        assert re.fullmatch(r'(?:v?(?:'+sre+r')(?:\.[0-9]+)?|(?:'+sre+r')-latest)',v), 'Use a supported stable tag or series: '+', '.join(series_ok)
         if not v.endswith('-latest') and not v.startswith('v'): v='v'+v
         series=re.match(r'v?([0-9]+\.[0-9]+)',v).group(1)
-        a=a if e['CPU_ARCH']=='profile' else e['CPU_ARCH']; assert a in ['x86-64','westmere','sandybridge','ivybridge','skylake']
+        # Each -march level below includes the ones before it. A target newer than the profile CPU
+        # builds fine and then dies with an illegal instruction on the real machine.
+        order=['x86-64','westmere','sandybridge','ivybridge','skylake']; pa=a
+        a=a if e['CPU_ARCH']=='profile' else e['CPU_ARCH']; assert a in order
+        assert order.index(a)<=order.index(pa), f'cpu_arch {a} is newer than the {m} CPU ({pa}); that kernel would not boot there'
         # MuQSS is built around a low tick: -ck converts short sleeps and timeouts to hrtimers,
         # so 'profile' follows Con Kolivas' 100 Hz default. An explicit value still wins.
         if e['TIMER_FREQ']=='profile': h='100' if e['CPU_SCHEDULER']=='muqss' else h
         else: h=e['TIMER_FREQ']
-        assert h in ['100','250','300','500','1000']
+        assert h in ['100','250','300','500','750','1000']
+        pn=n
         n=n if e['NR_CPUS']=='profile' else e['NR_CPUS']; assert n in ['4','8','12']
+        if int(n)<int(pn): print(f'::warning::nr_cpus {n} is below the {m} profile ({pn}); the kernel will ignore the other logical CPUs')
         assert e['PREEMPTION']!='rt' or e['CPU_SCHEDULER']=='eevdf', 'RT requires EEVDF (linux-tkg offers no alternative schedulers with PREEMPT_RT)'
         assert e['SCHED_EXT']!='require' or e['CPU_SCHEDULER'] in ('bore','eevdf'), 'sched_ext only works with BORE or EEVDF; PDS, BMQ and MuQSS replace the scheduler core it plugs into'
         rq=e['MUQSS_RUNQUEUE'] if e['CPU_SCHEDULER']=='muqss' else 'n/a'
@@ -254,6 +369,8 @@ jobs:
         with open(e['GITHUB_ENV'],'a') as f:
             for k,val in resolved.items(): f.write('BUILD_'+k+'='+val+'\n')
         print(json.dumps(resolved,indent=2))
+        with open(e['GITHUB_STEP_SUMMARY'],'a') as f:
+            f.write('### Resolved build\n'+''.join(f'    {k}: {val}\n' for k,val in resolved.items()))
         PYCODE
     - name: Free up disk space
       run: |
@@ -307,7 +424,7 @@ jobs:
         if [ -n "$patch" ]; then
           f="linux-tkg/linux-tkg-patches/$BUILD_SERIES/$patch"
           if [ ! -s "$f" ]; then
-            avail=$(ls linux-tkg/linux-tkg-patches/*/"$patch" 2>/dev/null | awk -F/ '{print $(NF-1)}' | sort -V | tr '\n' ' ')
+            avail=$(ls linux-tkg/linux-tkg-patches/*/"$patch" 2>/dev/null | awk -F/ '{print $(NF-1)}' | sort -V | tr '\n' ' ' || true)
             echo "::error::'$BUILD_SCHEDULER' is not available for $BUILD_SERIES at TKG_REF (no $patch). Series with it: ${avail:-none}"
             exit 1
           fi
@@ -469,7 +586,8 @@ jobs:
         for f in t.glob('*.myfrag'): shutil.copyfile(f,p/'dist/metadata'/f.name)
         PYCODE
     - name: Restore compiler cache
-      uses: actions/cache@v5
+      id: ccache
+      uses: actions/cache/restore@v5
       with:
         path: ${{ env.CCACHE_DIR }}
         key: tkg-${{ runner.os }}-${{ inputs.machine }}-${{ env.TKG_REF }}-${{ env.BUILD_COMPILER }}-${{ env.BUILD_ARCH
@@ -485,7 +603,7 @@ jobs:
         if [ "$BUILD_SCHED_EXT" = require ]; then sudo apt-get install -y dwarves; fi
         sudo /usr/sbin/update-ccache-symlinks
         printf '%s\n' /usr/lib/ccache >> "$GITHUB_PATH"
-        ccache --max-size=2G
+        ccache --max-size=4G
         ccache --zero-stats
         { gcc --version; ld --version; ccache --version; if [ "$BUILD_COMPILER" = llvm ]; then clang --version; ld.lld --version; fi; if command -v pahole >/dev/null; then echo "pahole $(pahole --version)"; fi; } > dist/metadata/toolchain.txt
         printf '%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}" > dist/metadata/runner.txt
@@ -568,7 +686,8 @@ jobs:
         # SCHED_CLASS_EXT entry itself rather than anywhere else in the file.
         if gate:
             blk=re.search(r'^config SCHED_CLASS_EXT\n(.*?)(?=^\S|\Z)',pathlib.Path('kernel/Kconfig.preempt').read_text(),re.M|re.S)
-            if blk and not re.search(r'^\s+depends on[^\n]*!'+gate,blk.group(1),re.M): errors.append(f'{sched} gate (depends on !{gate}) missing from SCHED_CLASS_EXT in kernel/Kconfig.preempt')
+            if not blk: errors.append(f'SCHED_CLASS_EXT entry not found in kernel/Kconfig.preempt; cannot confirm the {sched} gate')
+            elif not re.search(r'^\s+depends on[^\n]*!'+gate,blk.group(1),re.M): errors.append(f'{sched} gate (depends on !{gate}) missing from SCHED_CLASS_EXT in kernel/Kconfig.preempt')
         # patch keeps going after a failed hunk; a .rej file means part of a patch is silently missing.
         rej=sorted(str(r) for r in pathlib.Path('.').rglob('*.rej') if '.git' not in r.parts)
         if rej: errors.append('Rejected patch hunks: '+', '.join(rej))
@@ -622,7 +741,9 @@ jobs:
             rows.append(f'{f.name}\t{name}\t{arch}')
             found.add(name)
             # Debug-symbol packages (from sched_ext=require builds) are huge; list them but do not upload.
-            if not name.endswith('-dbg'): shutil.copyfile(f,p/f.name)
+            # linux-libc-dev is listed but not uploaded either: "dpkg -i *.deb" on the target would replace
+            # Devuan's userspace kernel headers, which the image and headers packages do not need.
+            if not name.endswith('-dbg') and name!='linux-libc-dev': shutil.copyfile(f,p/f.name)
         assert 'linux-image-'+release in found, 'Matching image missing'
         assert 'linux-headers-'+release in found, 'Matching headers missing'
         (p/'metadata/packages.tsv').write_text('\n'.join(rows)+'\n')
@@ -636,6 +757,23 @@ jobs:
         ccache --show-stats > dist/metadata/ccache.txt 2>&1 || true
         if [ -d linux-tkg/logs ]; then cp -r linux-tkg/logs dist/metadata/tkg-logs; fi
         if [ -f linux-tkg/kernelconfig.new ]; then cp linux-tkg/kernelconfig.new dist/metadata/tkg-final.config; fi
+        # Rejected hunks are the first thing needed when a pin or kernel bump fails.
+        if [ -d linux-tkg ]; then
+          rej=$(find linux-tkg -name '*.rej' -not -path '*/.git/*' 2>/dev/null || true)
+          if [ -n "$rej" ]; then
+            mkdir -p dist/metadata/rejects
+            while IFS= read -r r; do cp --parents "$r" dist/metadata/rejects/ || true; done <<< "$rej"
+            echo "::warning::Rejected hunks saved in the build records: $(wc -l <<< "$rej") file(s)"
+          fi
+        fi
+        # Only save the compiler cache when the build got far enough to put something in it.
+        if [ -d "$CCACHE_DIR" ] && [ -n "$(ls -A "$CCACHE_DIR" 2>/dev/null)" ]; then echo 'CCACHE_SAVE=1' >> "$GITHUB_ENV"; fi
+    - name: Save compiler cache (also after a failed build)
+      if: always() && env.CCACHE_SAVE == '1'
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ${{ steps.ccache.outputs.cache-primary-key }}
     - name: Upload validated packages
       uses: actions/upload-artifact@v6
       with:
@@ -653,3 +791,5 @@ jobs:
         path: dist/metadata/
         if-no-files-found: warn
         retention-days: 30
+ 
+Claude finished the response
