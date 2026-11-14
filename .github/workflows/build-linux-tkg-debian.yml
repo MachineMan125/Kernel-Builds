@@ -1,3 +1,8 @@
+# Revision 17: automatic builds. The workflow also runs once a day on a schedule. A new "plan" job finds the newest
+#   stable release of AUTO_SERIES and builds it, with AUTO_SCHEDULER, for every machine in AUTO_MACHINES that does not
+#   have it yet; a new "release" job publishes the packages as a GitHub Release (linux-<version>-<scheduler>). A run
+#   started by hand builds exactly what was asked, as before, and publishes nothing. The build job is now a matrix fed
+#   by the plan job, so it reads matrix.* where it used to read inputs.*; concurrency moved from the workflow to the job.
 # Revision 16: review fixes, no change to what a default build produces. sched_ext "auto" is renamed "off": the CI fragment
 #   forces DEBUG_INFO_NONE, SCHED_CLASS_EXT needs BTF, so "auto" never enabled it. cpu_arch newer than the profile CPU is
 #   rejected (it would not boot). timer_freq gains 750 (already handled by the Hz step). The compiler cache is now saved after
@@ -43,8 +48,12 @@
 # MuQSS on optiplex3090: smt (default) = 6 queues, one per core; none = 12 queues; mc and wider = one queue
 # for all 12 threads (single die, single L3, so mc / mc-llc / smp / all behave the same).
 name: Build linux-tkg (Devuan device profiles)
-run-name: "${{ inputs.machine }} / ${{ inputs.kernel_version }} / ${{ inputs.cpu_scheduler }}${{ inputs.build_label && format(' / {0}', inputs.build_label) || '' }}"
+run-name: "${{ github.event_name == 'schedule' && 'Scheduled check for a new stable kernel' || format('{0} / {1} / {2}{3}', inputs.machine, inputs.kernel_version, inputs.cpu_scheduler, inputs.build_label && format(' / {0}', inputs.build_label) || '') }}"
 'on':
+  schedule:
+  # 09:43 UTC every day. GitHub only runs schedules from the default branch and pauses them
+  # after 60 days without commits (re-enable on the Actions page).
+  - cron: '43 9 * * *'
   workflow_dispatch:
     inputs:
       machine:
@@ -176,9 +185,6 @@ run-name: "${{ inputs.machine }} / ${{ inputs.kernel_version }} / ${{ inputs.cpu
         default: ''
 permissions:
   contents: read
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.machine }}-${{ inputs.cpu_scheduler }}
-  cancel-in-progress: false
 defaults:
   run:
     shell: bash -euo pipefail {0}
@@ -186,10 +192,95 @@ env:
   TKG_REF: 6227ce308da890087da4a9d1d38d1b71dba7eb27
   TKG_REPO: https://github.com/Frogging-Family/linux-tkg.git
   CCACHE_DIR: ${{ github.workspace }}/.ccache
+  # ---- Automatic (scheduled) builds: edit these three lines to change what gets built by itself ----
+  # Kernel series to follow, scheduler to use, and the machines to build for (space separated).
+  # A machine without configs/<machine>.config is skipped with a warning.
+  AUTO_SERIES: '7.3'
+  AUTO_SCHEDULER: muqss
+  AUTO_MACHINES: nuc7 i3-6100 optiplex3090 z220 e6410
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      publish: ${{ steps.plan.outputs.publish }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      machines: ${{ steps.plan.outputs.machines }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        persist-credentials: false
+    - name: Decide what to build
+      id: plan
+      env:
+        EVENT: ${{ github.event_name }}
+        INPUTS_JSON: ${{ toJSON(inputs) }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        LATEST=''
+        if [ "$EVENT" = schedule ]; then
+          # Newest stable tag of the series: kernel.org first, Greg KH's GitHub mirror as a fallback.
+          for url in https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git https://github.com/gregkh/linux; do
+            tags=$(git ls-remote --tags "$url" "refs/tags/v${AUTO_SERIES}.*" 2>/dev/null || true)
+            LATEST=$(printf '%s\n' "$tags" | sed -n 's#.*refs/tags/v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$#\1#p' | sort -V | tail -n 1)
+            if [ -n "$LATEST" ]; then echo "Newest $AUTO_SERIES release: $LATEST (from $url)"; break; fi
+          done
+          [ -n "$LATEST" ] || { echo "::error::Could not find any v${AUTO_SERIES}.x tag"; exit 1; }
+        fi
+        export LATEST
+        python3 - <<'PYCODE'
+        import os,json,re,subprocess,pathlib
+        e=os.environ; repo=e['GITHUB_REPOSITORY']
+        if e['EVENT']!='schedule':
+            # Started by hand: build exactly what was asked, publish nothing.
+            matrix=[json.loads(e['INPUTS_JSON'])]
+            out=dict(publish='false',version='',tag='',machines=matrix[0]['machine'])
+            msg=f"Manual build: {matrix[0]['machine']} / {matrix[0]['kernel_version']} / {matrix[0]['cpu_scheduler']}"
+        else:
+            ver=e['LATEST']; sched=e['AUTO_SCHEDULER']; machines=e['AUTO_MACHINES'].split()
+            assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+',ver) and re.fullmatch(r'[a-z]+',sched) and machines
+            tag=f'linux-{ver}-{sched}'
+            # A machine is done for this kernel once the release carries its SHA256SUMS-<machine>.txt.
+            r=subprocess.run(['gh','api',f'repos/{repo}/releases/tags/{tag}','--jq','.assets[].name'],capture_output=True,text=True)
+            if r.returncode==0: have=set(r.stdout.split())
+            elif 'Not Found' in r.stdout+r.stderr or '404' in r.stdout+r.stderr: have=set()
+            else: raise SystemExit('Could not read the release list: '+(r.stderr or r.stdout).strip())
+            todo=[]; notes=[]
+            for m in machines:
+                if not pathlib.Path('configs',m+'.config').is_file():
+                    print(f'::warning::{m} is in AUTO_MACHINES but configs/{m}.config is missing; skipped'); notes.append(f'{m}: skipped, no configs/{m}.config')
+                elif f'SHA256SUMS-{m}.txt' in have: notes.append(f'{m}: already built')
+                else: todo.append(m); notes.append(f'{m}: to build')
+            # The same settings a manual run uses by default, with the automatic scheduler and an exact kernel tag
+            # so that every machine builds the same release.
+            matrix=[dict(machine=m,kernel_version='v'+ver,cpu_scheduler=sched,muqss_runqueue='smt',sched_ext='off',preemption='full',
+                         compiler='gcc',opt_level='1',timer_freq='profile',cpu_governor='schedutil',cpu_arch='profile',nr_cpus='profile',
+                         module_trimming='none',build_label='') for m in todo]
+            out=dict(publish='true',version=ver,tag=tag,machines=' '.join(todo))
+            msg=f"Linux {ver} ({sched}): "+('building for '+', '.join(todo) if todo else 'nothing to do')+'\n\n'+'\n'.join('- '+n for n in notes)
+        out.update(matrix=json.dumps(matrix,separators=(',',':')),count=str(len(matrix)))
+        with open(e['GITHUB_OUTPUT'],'a') as f:
+            for k,v in out.items(): f.write(f'{k}={v}\n')
+        with open(e['GITHUB_STEP_SUMMARY'],'a') as f: f.write('### '+msg+'\n')
+        print(msg)
+        PYCODE
   build:
+    needs: plan
+    if: ${{ needs.plan.outputs.count != '0' }}
+    name: build (${{ matrix.machine }})
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.machine }}-${{ matrix.cpu_scheduler }}
+      cancel-in-progress: false
     steps:
     - name: Checkout private repository
       uses: actions/checkout@v5
@@ -197,20 +288,20 @@ jobs:
         persist-credentials: false
     - name: Resolve profile and validate inputs
       env:
-        MACHINE: ${{ inputs.machine }}
-        KERNEL_VERSION: ${{ inputs.kernel_version }}
-        CPU_SCHEDULER: ${{ inputs.cpu_scheduler }}
-        MUQSS_RUNQUEUE: ${{ inputs.muqss_runqueue }}
-        SCHED_EXT: ${{ inputs.sched_ext }}
-        PREEMPTION: ${{ inputs.preemption }}
-        COMPILER: ${{ inputs.compiler }}
-        OPT_LEVEL: ${{ inputs.opt_level }}
-        TIMER_FREQ: ${{ inputs.timer_freq }}
-        CPU_GOVERNOR: ${{ inputs.cpu_governor }}
-        CPU_ARCH: ${{ inputs.cpu_arch }}
-        NR_CPUS: ${{ inputs.nr_cpus }}
-        MODULE_TRIMMING: ${{ inputs.module_trimming }}
-        BUILD_LABEL: ${{ inputs.build_label }}
+        MACHINE: ${{ matrix.machine }}
+        KERNEL_VERSION: ${{ matrix.kernel_version }}
+        CPU_SCHEDULER: ${{ matrix.cpu_scheduler }}
+        MUQSS_RUNQUEUE: ${{ matrix.muqss_runqueue }}
+        SCHED_EXT: ${{ matrix.sched_ext }}
+        PREEMPTION: ${{ matrix.preemption }}
+        COMPILER: ${{ matrix.compiler }}
+        OPT_LEVEL: ${{ matrix.opt_level }}
+        TIMER_FREQ: ${{ matrix.timer_freq }}
+        CPU_GOVERNOR: ${{ matrix.cpu_governor }}
+        CPU_ARCH: ${{ matrix.cpu_arch }}
+        NR_CPUS: ${{ matrix.nr_cpus }}
+        MODULE_TRIMMING: ${{ matrix.module_trimming }}
+        BUILD_LABEL: ${{ matrix.build_label }}
       run: |
         python3 - <<'PYCODE'
         import os,re,json,pathlib
@@ -491,10 +582,10 @@ jobs:
       uses: actions/cache/restore@v5
       with:
         path: ${{ env.CCACHE_DIR }}
-        key: tkg-${{ runner.os }}-${{ inputs.machine }}-${{ env.TKG_REF }}-${{ env.BUILD_COMPILER }}-${{ env.BUILD_ARCH
+        key: tkg-${{ runner.os }}-${{ matrix.machine }}-${{ env.TKG_REF }}-${{ env.BUILD_COMPILER }}-${{ env.BUILD_ARCH
           }}-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: |
-          tkg-${{ runner.os }}-${{ inputs.machine }}-${{ env.TKG_REF }}-${{ env.BUILD_COMPILER }}-${{ env.BUILD_ARCH }}-
+          tkg-${{ runner.os }}-${{ matrix.machine }}-${{ env.TKG_REF }}-${{ env.BUILD_COMPILER }}-${{ env.BUILD_ARCH }}-
     - name: Install and configure compiler cache
       run: |
         sudo apt-get update
@@ -688,7 +779,55 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v6
       with:
-        name: linux-tkg-records-${{ inputs.machine }}-${{ github.run_id }}-${{ github.run_attempt }}
+        name: linux-tkg-records-${{ matrix.machine }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: dist/metadata/
         if-no-files-found: warn
         retention-days: 30
+  release:
+    needs: [plan, build]
+    # Scheduled runs only. Publishes whatever built, even if another machine's build failed;
+    # a machine that failed has no SHA256SUMS-<machine>.txt in the release and is retried next time.
+    if: ${{ !cancelled() && needs.plan.outputs.publish == 'true' && needs.plan.outputs.count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    steps:
+    - name: Publish packages as a GitHub Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VER: ${{ needs.plan.outputs.version }}
+        TAG: ${{ needs.plan.outputs.tag }}
+        MACHINES: ${{ needs.plan.outputs.machines }}
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        mkdir -p dl out
+        names=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --jq '.artifacts[].name')
+        built=''
+        for m in $MACHINES; do
+          # Package artifacts are named linux-tkg-<machine>-<scheduler>-...; take the newest attempt.
+          name=$(printf '%s\n' "$names" | awk -v p="linux-tkg-${m}-${AUTO_SCHEDULER}-" 'index($0,p)==1 {n=$0} END {print n}')
+          if [ -z "$name" ]; then echo "::warning::No packages for $m (its build failed); it will be retried on the next scheduled run"; continue; fi
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" -n "$name" -D "dl/$m"
+          (cd "dl/$m" && sha256sum -c SHA256SUMS)
+          cp "dl/$m"/*.deb out/
+          cp "dl/$m/SHA256SUMS" "out/SHA256SUMS-$m.txt"
+          built="$built $m"
+        done
+        [ -n "$built" ] || { echo "::error::No machine built successfully; nothing to publish"; exit 1; }
+        ls -lh out
+        if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
+        else
+          {
+            echo "linux-tkg $VER with the $AUTO_SCHEDULER scheduler, built automatically for:$built."
+            echo
+            echo "Each machine has its own linux-image and linux-headers package (the machine name is part of the file name) and a SHA256SUMS-<machine>.txt. Install on the matching machine with, for example:"
+            echo
+            echo '    sudo dpkg -i linux-image-*-nuc7-*.deb linux-headers-*-nuc7-*.deb'
+          } > notes.md
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Linux $VER ($AUTO_SCHEDULER)" --notes-file notes.md
+        fi
+        echo "### Published $TAG for:$built" >> "$GITHUB_STEP_SUMMARY"
