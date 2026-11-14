@@ -197,7 +197,7 @@ env:
   # A machine without configs/<machine>.config is skipped with a warning.
   AUTO_SERIES: '7.3'
   AUTO_SCHEDULER: muqss
-  AUTO_MACHINES: nuc7 i3-6100 optiplex3090 e6410
+  AUTO_MACHINES: nuc7 i3-6100 optiplex3090 z220 e6410
 jobs:
   plan:
     runs-on: ubuntu-24.04
