@@ -53,7 +53,7 @@ run-name: "${{ github.event_name == 'schedule' && 'Scheduled check for a new sta
   schedule:
   # 09:43 UTC every day. GitHub only runs schedules from the default branch and pauses them
   # after 60 days without commits (re-enable on the Actions page).
-  - cron: '43 9 * * *'
+  - cron: '47 9 * * *'
   workflow_dispatch:
     inputs:
       machine:
