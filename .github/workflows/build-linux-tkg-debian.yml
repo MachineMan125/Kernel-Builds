@@ -223,8 +223,9 @@ jobs:
       run: |
         LATEST=''
         if [ "$EVENT" = schedule ]; then
-          # Newest stable tag of the series: kernel.org first, Greg KH's GitHub mirror as a fallback.
-          for url in https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git https://github.com/gregkh/linux; do
+          # Newest stable tag of the series: Greg KH's GitHub mirror first, because the builds fetch from it
+          # (_git_mirror=gregkh), so the chosen tag is always one they can find; kernel.org as a fallback.
+          for url in https://github.com/gregkh/linux https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git; do
             tags=$(git ls-remote --tags "$url" "refs/tags/v${AUTO_SERIES}.*" 2>/dev/null || true)
             LATEST=$(printf '%s\n' "$tags" | sed -n 's#.*refs/tags/v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$#\1#p' | sort -V | tail -n 1)
             if [ -n "$LATEST" ]; then echo "Newest $AUTO_SERIES release: $LATEST (from $url)"; break; fi
@@ -545,7 +546,10 @@ jobs:
         # Schedulers that replace the core scheduler; linux-tkg turns PSI off for all of them.
         alt=e['BUILD_SCHEDULER'] in ('pds','bmq','muqss')
         scx=e['BUILD_SCHED_EXT']=='require'
-        cfg={'_distro': 'Debian', '_preempt_rt_force': '0', '_sched_yield_type': '1', '_rr_interval': 'default', '_bore_min_base_slice_ns': '2000000', '_smt_nice': 'true', '_tickless': '2', '_install_after_building': 'no', '_logging_use_script': 'no', '_menunconfig': 'false', '_diffconfig': 'false', '_user_patches': 'false', '_user_patches_no_confirm': 'false', '_config_fragments': 'true', '_config_fragments_no_confirm': 'true', '_community_patches': '', '_configfile': 'ci-base.config', '_config_updating': 'olddefconfig', '_offline': '', '_force_all_threads': 'true', '_noccache': 'false', '_glitched_base': 'true', '_zenify': 'true', '_misc_adds': 'true', '_clear_patches': 'true', '_openrgb': 'false', '_mglru': 'true', '_ntsync': 'false', '_aggressive_ondemand': 'true', '_random_trust_cpu': 'true', '_acs_override': 'false', '_ftracedisable': 'false', '_numadisable': 'false', '_debugdisable': 'false', '_STRIP': 'true', '_NR_CPUS_value': '', '_tcp_cong_alg': '', '_custom_commandline': '', '_lto_mode': 'no', '_llvm_ias': '1', '_libunwind_replace': 'false', 'KCFLAGS': '', 'KCPPFLAGS': '', 'KRUSTFLAGS': '', '_nofallback': 'true', '_kernel_on_diet': 'false'}
+        # _git_mirror: linux-tkg's "gregkh" alias (https://github.com/gregkh/linux.git). Its pre-fetch check is
+        # "timeout 10 git ls-remote" over every ref of the stable tree; from GitHub runners kernel.org sometimes needs
+        # longer than 10 s (scheduled run 43943692430, build (e6410): "Remote unreachable or took too long to respond").
+        cfg={'_distro': 'Debian', '_git_mirror': 'gregkh', '_preempt_rt_force': '0', '_sched_yield_type': '1', '_rr_interval': 'default', '_bore_min_base_slice_ns': '2000000', '_smt_nice': 'true', '_tickless': '2', '_install_after_building': 'no', '_logging_use_script': 'no', '_menunconfig': 'false', '_diffconfig': 'false', '_user_patches': 'false', '_user_patches_no_confirm': 'false', '_config_fragments': 'true', '_config_fragments_no_confirm': 'true', '_community_patches': '', '_configfile': 'ci-base.config', '_config_updating': 'olddefconfig', '_offline': '', '_force_all_threads': 'true', '_noccache': 'false', '_glitched_base': 'true', '_zenify': 'true', '_misc_adds': 'true', '_clear_patches': 'true', '_openrgb': 'false', '_mglru': 'true', '_ntsync': 'false', '_aggressive_ondemand': 'true', '_random_trust_cpu': 'true', '_acs_override': 'false', '_ftracedisable': 'false', '_numadisable': 'false', '_debugdisable': 'false', '_STRIP': 'true', '_NR_CPUS_value': '', '_tcp_cong_alg': '', '_custom_commandline': '', '_lto_mode': 'no', '_llvm_ias': '1', '_libunwind_replace': 'false', 'KCFLAGS': '', 'KCPPFLAGS': '', 'KRUSTFLAGS': '', '_nofallback': 'true', '_kernel_on_diet': 'false'}
         cfg.update(_version=e['BUILD_VERSION'],_cpusched=e['BUILD_SCHEDULER'],_compiler=e['BUILD_COMPILER'],_compileroptlevel=e['BUILD_OPT'],_processor_opt=e['BUILD_ARCH'],_timer_freq=e['BUILD_HZ'],_default_cpu_gov=e['BUILD_GOVERNOR'],_kernel_localversion=e['BUILD_SUFFIX'],_NR_CPUS_value=e['BUILD_NR'],_preempt_rt='1' if e['BUILD_PREEMPTION']=='rt' else '0',_modprobeddb='true' if e['BUILD_TRIMMING']=='modprobed-db' else 'false',_modprobeddb_db_path=str(p/'modules'/ (e['BUILD_MACHINE']+'.db')))
         if e['BUILD_SCHEDULER']=='muqss': cfg['_runqueue_sharing']=e['BUILD_RUNQUEUE']; cfg['_irq_threading']='false'
         # _STRIP=true makes linux-tkg force DEBUG_INFO_NONE, which silently removes BTF and therefore sched_ext.
