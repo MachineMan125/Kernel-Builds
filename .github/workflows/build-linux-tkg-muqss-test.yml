@@ -24,6 +24,9 @@
 #   nuc7          7.3-latest  skylake  4   Intel NUC7 (2C/4T): smt = 2 queues, mc = 1 queue for all 4 threads
 #   i3-6100       7.3-latest  skylake  4   Core i3-6100 (2C/4T, one L3): same layouts as nuc7
 #   optiplex3090  7.3-latest  skylake  12  i5-10500T (6C/12T, one L3): smt = 6 queues, mc = 1 queue, none = 12
+#   z220          7.3-latest  ivybridge 8  HP Z220, i5-3470 (4C/4T, no Hyper-Threading, one L3): smt = none = 4 queues,
+#                                          mc = 1 queue. 8 CPUs also covers 4C/8T Xeon E3-12x0 v2 boards. A Sandy Bridge
+#                                          CPU (E3-12x0 v1, i-2xxx) needs cpu_arch sandybridge.
 name: Build linux-tkg MuQSS test (Devuan device profiles)
 run-name: "MuQSS test: ${{ inputs.machine }} / ${{ inputs.kernel_version }} / rq ${{ inputs.muqss_runqueue }} / psi ${{ inputs.psi }} / iotime ${{ inputs.iotime }}${{ inputs.build_label && format(' / {0}', inputs.build_label) || '' }}"
 'on':
@@ -38,6 +41,7 @@ run-name: "MuQSS test: ${{ inputs.machine }} / ${{ inputs.kernel_version }} / rq
         - nuc7
         - i3-6100
         - optiplex3090
+        - z220
       kernel_version:
         description: 'profile (= 7.3-latest), exact tag (v7.3.4), or series (7.3-latest). Supported: 7.2 / 7.3'
         required: true
@@ -135,7 +139,7 @@ run-name: "MuQSS test: ${{ inputs.machine }} / ${{ inputs.kernel_version }} / rq
         - '750'
         - '1000'
       cpu_governor:
-        description: Default generic governor; NUC, i3-6100 and OptiPlex 3090 active intel_pstate use their own algorithms
+        description: Default generic governor; NUC, i3-6100, OptiPlex 3090 and Z220 active intel_pstate use their own algorithms
         required: true
         type: choice
         default: schedutil
@@ -151,9 +155,11 @@ run-name: "MuQSS test: ${{ inputs.machine }} / ${{ inputs.kernel_version }} / rq
         options:
         - profile
         - x86-64
+        - sandybridge
+        - ivybridge
         - skylake
       nr_cpus:
-        description: 'Maximum logical CPUs; profile: NUC 4 / i3-6100 4 / OptiPlex 3090 12. Check actual hardware.'
+        description: 'Maximum logical CPUs; profile: NUC 4 / i3-6100 4 / OptiPlex 3090 12 / Z220 8. Check actual hardware.'
         required: true
         type: choice
         default: profile
@@ -255,6 +261,7 @@ jobs:
             'nuc7':        ('7.3-latest','skylake','100','4'),
             'i3-6100':     ('7.3-latest','skylake','100','4'),
             'optiplex3090':('7.3-latest','skylake','100','12'),
+            'z220':        ('7.3-latest','ivybridge','100','8'),
         }
         # Kernel series this workflow accepts (MuQSS exists for 7.1+ at TKG_REF; 7.1 is no longer maintained).
         series_ok=['7.2','7.3']
