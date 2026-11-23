@@ -503,6 +503,31 @@ jobs:
             f.write_text(new)
             note('replaced SCHED_CLASS_EXT hunk with a config+prompt anchored insertion')
         PYCODE
+    - name: Drop MuQSS swim.c hunks (m68k-only driver, rewritten in 7.3.6)
+      if: env.BUILD_SCHEDULER == 'muqss'
+      run: |
+        python3 - <<'PYCODE'
+        # MuQSS's only change to drivers/block/swim.c (Macintosh SWIM floppy) turns its schedule_timeout(1) polling
+        # loops into schedule_min_hrtimeout(). 7.3.6 backported a rewrite of those loops to a readx_poll_timeout-style
+        # swim_readbit_timeout() macro, so all three hunks fail ("3 out of 3 hunks FAILED") and linux-tkg stops in
+        # prepare. BLK_DEV_SWIM depends on M68K && MAC, so the driver is never built on x86 and the section can go on
+        # every series. verify-config.py still fails the build on any .rej file.
+        import os,re,pathlib
+        e=os.environ; p=pathlib.Path(e['GITHUB_WORKSPACE'])
+        f=p/'linux-tkg/linux-tkg-patches'/e['BUILD_SERIES']/'0004-muqss.patch'
+        out=p/'dist/metadata/muqss-swim-fix.txt'
+        def note(msg,level='notice'):
+            print(f'::{level}::muqss-swim-fix: {msg}'); out.write_text(msg+'\n')
+        s=f.read_text()
+        rx=re.compile(r'^diff --git a/drivers/block/swim\.c b/drivers/block/swim\.c\n.*?(?=^diff --git |^From [0-9a-f]{40} |^-- $|\Z)',re.M|re.S)
+        new,count=rx.subn('',s)
+        if not count:
+            note('no drivers/block/swim.c section in 0004-muqss.patch; nothing to do'); raise SystemExit(0)
+        if re.search(r'^(?:diff --git a/|\+\+\+ b/)drivers/block/swim\.c',new,re.M):
+            note('drivers/block/swim.c still referenced after removal; review 0004-muqss.patch','error'); raise SystemExit(1)
+        f.write_text(new)
+        note(f'removed {count} drivers/block/swim.c section(s) from 0004-muqss.patch')
+        PYCODE
     - name: Add 500 / 750 Hz timer options for PDS / BMQ / MuQSS
       if: contains(fromJSON('["muqss","pds","bmq"]'), env.BUILD_SCHEDULER)
       run: |
