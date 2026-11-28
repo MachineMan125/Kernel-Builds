@@ -1,3 +1,8 @@
+# Revision 18: adds the e485 profile (Lenovo ThinkPad E485, Ryzen 3 2200U Zen 1 / Raven Ridge, 2C/4T, 7.3-latest, znver1,
+#   BORE, 1000 Hz with tickless idle). cpu_arch gains znver1; the Intel -march ladder becomes a per-profile list of safe
+#   targets, so an AMD profile only accepts x86-64 or its own target. AUTO_MACHINES entries may now carry their own
+#   scheduler (machine:scheduler, e.g. e485:bore); the plan job groups machines by scheduler and the release job publishes
+#   one linux-<version>-<scheduler> Release per group.
 # Revision 17: automatic builds. The workflow also runs once a day on a schedule. A new "plan" job finds the newest
 #   stable release of AUTO_SERIES and builds it, with AUTO_SCHEDULER, for every machine in AUTO_MACHINES that does not
 #   have it yet; a new "release" job publishes the packages as a GitHub Release (linux-<version>-<scheduler>). A run
@@ -43,7 +48,10 @@
 #   optiplex3090  v7.3.1    skylake    500  12  Dell OptiPlex 3090 (i5-10500T Comet Lake, 6C/12T, one L3), active intel_pstate
 #   z220          v6.18.60  ivybridge  500  8   HP Z220
 #   e6410         v6.18.60  westmere   300  4   Dell Latitude E6410 (adds swap / zswap)
+#   e485          7.3-latest znver1    1000 4   Lenovo ThinkPad E485 (Ryzen 3 2200U, Zen 1, 2C/4T, one CCX); acpi-cpufreq
+#                                               (Zen 1 has no CPPC, so amd-pstate does not load), schedutil
 # Recommended defaults for every profile: bore, full preemption, gcc, O2, sched_ext off, module_trimming none.
+# Every profile builds with tickless idle (_tickless=2 / CONFIG_NO_HZ_IDLE).
 # MuQSS on the 4-thread Skylake profiles: runqueue smt (default); mc is the only other distinct layout there.
 # MuQSS on optiplex3090: smt (default) = 6 queues, one per core; none = 12 queues; mc and wider = one queue
 # for all 12 threads (single die, single L3, so mc / mc-llc / smp / all behave the same).
@@ -67,6 +75,7 @@ run-name: "${{ github.event_name == 'schedule' && 'Scheduled check for a new sta
         - optiplex3090
         - z220
         - e6410
+        - e485
       kernel_version:
         description: 'profile, exact tag (v6.18.60, or v7.3 for a .0 release), or series (6.18-latest). Supported: 6.18 / 7.2 / 7.3. MuQSS + profile uses 7.3-latest on 6.18 profiles'
         required: true
@@ -128,7 +137,7 @@ run-name: "${{ github.event_name == 'schedule' && 'Scheduled check for a new sta
         - '2'
         - '3'
       timer_freq:
-        description: 'profile: NUC 500, i3-6100 500, OptiPlex 3090 500, Z220 500, E6410 300 Hz; MuQSS profile = 100 Hz (-ck default); MuQSS on 7.2 has no 500 / 750 Hz'
+        description: 'profile: NUC 500, i3-6100 500, OptiPlex 3090 500, Z220 500, E6410 300, E485 1000 Hz; MuQSS profile = 100 Hz (-ck default); MuQSS on 7.2 has no 500 / 750 Hz'
         required: true
         type: choice
         default: profile
@@ -141,7 +150,7 @@ run-name: "${{ github.event_name == 'schedule' && 'Scheduled check for a new sta
         - '750'
         - '1000'
       cpu_governor:
-        description: Default generic governor; NUC, i3-6100 and OptiPlex 3090 active intel_pstate use their own algorithms
+        description: Default generic governor; NUC, i3-6100 and OptiPlex 3090 active intel_pstate use their own algorithms; E485 uses acpi-cpufreq (schedutil recommended)
         required: true
         type: choice
         default: schedutil
@@ -161,8 +170,9 @@ run-name: "${{ github.event_name == 'schedule' && 'Scheduled check for a new sta
         - sandybridge
         - ivybridge
         - skylake
+        - znver1
       nr_cpus:
-        description: 'Maximum logical CPUs; profile: NUC 4 / i3-6100 4 / OptiPlex 3090 12 / Z220 8 / E6410 4. Check actual hardware.'
+        description: 'Maximum logical CPUs; profile: NUC 4 / i3-6100 4 / OptiPlex 3090 12 / Z220 8 / E6410 4 / E485 4. Check actual hardware.'
         required: true
         type: choice
         default: profile
@@ -193,11 +203,13 @@ env:
   TKG_REPO: https://github.com/Frogging-Family/linux-tkg.git
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   # ---- Automatic (scheduled) builds: edit these three lines to change what gets built by itself ----
-  # Kernel series to follow, scheduler to use, and the machines to build for (space separated).
+  # Kernel series to follow, default scheduler, and the machines to build for (space separated).
+  # A machine can pick its own scheduler with machine:scheduler (bore, eevdf, pds, bmq or muqss); its packages
+  # then go to the linux-<version>-<scheduler> Release of that scheduler.
   # A machine without configs/<machine>.config is skipped with a warning.
   AUTO_SERIES: '7.3'
   AUTO_SCHEDULER: muqss
-  AUTO_MACHINES: nuc7 i3-6100 optiplex3090 z220 e6410
+  AUTO_MACHINES: nuc7 i3-6100 optiplex3090 z220 e6410 e485:bore
 jobs:
   plan:
     runs-on: ubuntu-24.04
@@ -207,8 +219,7 @@ jobs:
       count: ${{ steps.plan.outputs.count }}
       publish: ${{ steps.plan.outputs.publish }}
       version: ${{ steps.plan.outputs.version }}
-      tag: ${{ steps.plan.outputs.tag }}
-      machines: ${{ steps.plan.outputs.machines }}
+      releases: ${{ steps.plan.outputs.releases }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v5
@@ -239,30 +250,42 @@ jobs:
         if e['EVENT']!='schedule':
             # Started by hand: build exactly what was asked, publish nothing.
             matrix=[json.loads(e['INPUTS_JSON'])]
-            out=dict(publish='false',version='',tag='',machines=matrix[0]['machine'])
+            out=dict(publish='false',version='',releases='[]')
             msg=f"Manual build: {matrix[0]['machine']} / {matrix[0]['kernel_version']} / {matrix[0]['cpu_scheduler']}"
         else:
-            ver=e['LATEST']; sched=e['AUTO_SCHEDULER']; machines=e['AUTO_MACHINES'].split()
-            assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+',ver) and re.fullmatch(r'[a-z]+',sched) and machines
-            tag=f'linux-{ver}-{sched}'
-            # A machine is done for this kernel once the release carries its SHA256SUMS-<machine>.txt.
-            r=subprocess.run(['gh','api',f'repos/{repo}/releases/tags/{tag}','--jq','.assets[].name'],capture_output=True,text=True)
-            if r.returncode==0: have=set(r.stdout.split())
-            elif 'Not Found' in r.stdout+r.stderr or '404' in r.stdout+r.stderr: have=set()
-            else: raise SystemExit('Could not read the release list: '+(r.stderr or r.stdout).strip())
-            todo=[]; notes=[]
-            for m in machines:
+            ver=e['LATEST']; default=e['AUTO_SCHEDULER']; entries=e['AUTO_MACHINES'].split()
+            scheds=('bore','eevdf','pds','bmq','muqss')
+            assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+',ver) and default in scheds and entries
+            # machine or machine:scheduler
+            plan=[]
+            for x in entries:
+                m,_,s=x.partition(':'); s=s or default
+                assert re.fullmatch(r'[a-z0-9][a-z0-9-]*',m) and s in scheds, f'Invalid AUTO_MACHINES entry {x!r}'
+                plan.append((m,s))
+            # A machine is done for this kernel once its scheduler's release carries its SHA256SUMS-<machine>.txt.
+            assets={}
+            def have(tag):
+                if tag not in assets:
+                    r=subprocess.run(['gh','api',f'repos/{repo}/releases/tags/{tag}','--jq','.assets[].name'],capture_output=True,text=True)
+                    if r.returncode==0: assets[tag]=set(r.stdout.split())
+                    elif 'Not Found' in r.stdout+r.stderr or '404' in r.stdout+r.stderr: assets[tag]=set()
+                    else: raise SystemExit('Could not read the release list: '+(r.stderr or r.stdout).strip())
+                return assets[tag]
+            todo=[]; notes=[]; groups={}
+            for m,s in plan:
+                tag=f'linux-{ver}-{s}'
                 if not pathlib.Path('configs',m+'.config').is_file():
-                    print(f'::warning::{m} is in AUTO_MACHINES but configs/{m}.config is missing; skipped'); notes.append(f'{m}: skipped, no configs/{m}.config')
-                elif f'SHA256SUMS-{m}.txt' in have: notes.append(f'{m}: already built')
-                else: todo.append(m); notes.append(f'{m}: to build')
-            # The same settings a manual run uses by default, with the automatic scheduler and an exact kernel tag
+                    print(f'::warning::{m} is in AUTO_MACHINES but configs/{m}.config is missing; skipped'); notes.append(f'{m} ({s}): skipped, no configs/{m}.config')
+                elif f'SHA256SUMS-{m}.txt' in have(tag): notes.append(f'{m} ({s}): already built')
+                else: todo.append((m,s)); groups.setdefault(s,[]).append(m); notes.append(f'{m} ({s}): to build')
+            # The same settings a manual run uses by default, with the machine's scheduler and an exact kernel tag
             # so that every machine builds the same release.
-            matrix=[dict(machine=m,kernel_version='v'+ver,cpu_scheduler=sched,muqss_runqueue='smt',sched_ext='off',preemption='full',
+            matrix=[dict(machine=m,kernel_version='v'+ver,cpu_scheduler=s,muqss_runqueue='smt',sched_ext='off',preemption='full',
                          compiler='gcc',opt_level='1',timer_freq='profile',cpu_governor='schedutil',cpu_arch='profile',nr_cpus='profile',
-                         module_trimming='none',build_label='') for m in todo]
-            out=dict(publish='true',version=ver,tag=tag,machines=' '.join(todo))
-            msg=f"Linux {ver} ({sched}): "+('building for '+', '.join(todo) if todo else 'nothing to do')+'\n\n'+'\n'.join('- '+n for n in notes)
+                         module_trimming='none',build_label='') for m,s in todo]
+            releases=[dict(tag=f'linux-{ver}-{s}',scheduler=s,machines=' '.join(ms)) for s,ms in groups.items()]
+            out=dict(publish='true',version=ver,releases=json.dumps(releases,separators=(',',':')))
+            msg=f"Linux {ver}: "+('building '+', '.join(f'{m} ({s})' for m,s in todo) if todo else 'nothing to do')+'\n\n'+'\n'.join('- '+n for n in notes)
         out.update(matrix=json.dumps(matrix,separators=(',',':')),count=str(len(matrix)))
         with open(e['GITHUB_OUTPUT'],'a') as f:
             for k,v in out.items(): f.write(f'{k}={v}\n')
@@ -315,6 +338,8 @@ jobs:
             'optiplex3090':('v7.3.1',  'skylake',  '500','12'),
             'z220':        ('v6.18.60','ivybridge','500','8'),
             'e6410':       ('v6.18.60','westmere', '300','4'),
+            # Ryzen 3 2200U: Zen 1 (Raven Ridge). linux-tkg passes _processor_opt straight to -march.
+            'e485':        ('7.3-latest','znver1', '1000','4'),
         }
         # Kernel series this workflow accepts. Adding one here is only half the job:
         # the pinned linux-tkg must also carry patches for it (checked after cloning).
@@ -325,7 +350,7 @@ jobs:
             assert e[name] in allowed, 'Invalid '+name
         # MuQSS only exists for 7.1+. With kernel_version=profile, move 6.18 profiles to the newest
         # supported series instead of failing. An explicitly typed version is left alone.
-        if e['KERNEL_VERSION']=='profile' and e['CPU_SCHEDULER']=='muqss' and not v.startswith('v7.'):
+        if e['KERNEL_VERSION']=='profile' and e['CPU_SCHEDULER']=='muqss' and not re.match(r'v?7\.',v):
             newest=max(series_ok,key=lambda x:tuple(map(int,x.split('.'))))
             print(f'::notice::MuQSS needs Linux 7.1 or newer; {m} profile kernel {v} replaced with {newest}-latest')
             v=newest+'-latest'
@@ -334,11 +359,13 @@ jobs:
         assert re.fullmatch(r'(?:v?(?:'+sre+r')(?:\.[0-9]+)?|(?:'+sre+r')-latest)',v), 'Use a supported stable tag or series: '+', '.join(series_ok)
         if not v.endswith('-latest') and not v.startswith('v'): v='v'+v
         series=re.match(r'v?([0-9]+\.[0-9]+)',v).group(1)
-        # Each -march level below includes the ones before it. A target newer than the profile CPU
-        # builds fine and then dies with an illegal instruction on the real machine.
-        order=['x86-64','westmere','sandybridge','ivybridge','skylake']; pa=a
-        a=a if e['CPU_ARCH']=='profile' else e['CPU_ARCH']; assert a in order
-        assert order.index(a)<=order.index(pa), f'cpu_arch {a} is newer than the {m} CPU ({pa}); that kernel would not boot there'
+        # -march targets that are safe on each profile CPU. The Intel ladder is cumulative (each level includes the
+        # ones before it); AMD targets only get generic x86-64 below them. A target the CPU lacks builds fine and then
+        # dies with an illegal instruction on the real machine.
+        intel=['x86-64','westmere','sandybridge','ivybridge','skylake']
+        safe={**{x:intel[:i+1] for i,x in enumerate(intel)},'znver1':['x86-64','znver1']}; pa=a
+        a=a if e['CPU_ARCH']=='profile' else e['CPU_ARCH']; assert a in intel+['znver1'], 'Invalid CPU_ARCH'
+        assert a in safe[pa], f'cpu_arch {a} is not safe on the {m} CPU ({pa}); allowed: {", ".join(safe[pa])}'
         # MuQSS is built around a low tick: -ck converts short sleeps and timeouts to hrtimers,
         # so 'profile' follows Con Kolivas' 100 Hz default. An explicit value still wins.
         if e['TIMER_FREQ']=='profile': h='100' if e['CPU_SCHEDULER']=='muqss' else h
@@ -823,40 +850,45 @@ jobs:
       contents: write
       actions: read
     steps:
-    - name: Publish packages as a GitHub Release
+    - name: Publish packages as GitHub Releases (one per scheduler)
       env:
         GH_TOKEN: ${{ github.token }}
         VER: ${{ needs.plan.outputs.version }}
-        TAG: ${{ needs.plan.outputs.tag }}
-        MACHINES: ${{ needs.plan.outputs.machines }}
+        RELEASES: ${{ needs.plan.outputs.releases }}
         RUN_ID: ${{ github.run_id }}
       run: |
-        mkdir -p dl out
         names=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --jq '.artifacts[].name')
-        built=''
-        for m in $MACHINES; do
-          # Package artifacts are named linux-tkg-<machine>-<scheduler>-...; take the newest attempt.
-          name=$(printf '%s\n' "$names" | awk -v p="linux-tkg-${m}-${AUTO_SCHEDULER}-" 'index($0,p)==1 {n=$0} END {print n}')
-          if [ -z "$name" ]; then echo "::warning::No packages for $m (its build failed); it will be retried on the next scheduled run"; continue; fi
-          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" -n "$name" -D "dl/$m"
-          (cd "dl/$m" && sha256sum -c SHA256SUMS)
-          cp "dl/$m"/*.deb out/
-          cp "dl/$m/SHA256SUMS" "out/SHA256SUMS-$m.txt"
-          built="$built $m"
-        done
-        [ -n "$built" ] || { echo "::error::No machine built successfully; nothing to publish"; exit 1; }
-        ls -lh out
-        if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-          gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
-        else
-          {
-            echo "linux-tkg $VER with the $AUTO_SCHEDULER scheduler, built automatically for:$built."
-            echo
-            echo "Each machine has its own linux-image and linux-headers package (the machine name is part of the file name) and a SHA256SUMS-<machine>.txt. Install on the matching machine with, for example:"
-            echo
-            echo '    sudo dpkg -i linux-image-*-nuc7-*.deb linux-headers-*-nuc7-*.deb'
-          } > notes.md
-          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "Linux $VER ($AUTO_SCHEDULER)" --notes-file notes.md
-        fi
-        echo "### Published $TAG for:$built" >> "$GITHUB_STEP_SUMMARY"
+        published=''
+        while IFS=$'\t' read -r TAG SCHED MACHINES; do
+          rm -rf dl out; mkdir -p dl out
+          built=''
+          for m in $MACHINES; do
+            # Package artifacts are named linux-tkg-<machine>-<scheduler>-...; take the newest attempt.
+            name=$(printf '%s\n' "$names" | awk -v p="linux-tkg-${m}-${SCHED}-" 'index($0,p)==1 {n=$0} END {print n}')
+            if [ -z "$name" ]; then echo "::warning::No packages for $m ($SCHED; its build failed); it will be retried on the next scheduled run"; continue; fi
+            gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" -n "$name" -D "dl/$m"
+            (cd "dl/$m" && sha256sum -c SHA256SUMS)
+            cp "dl/$m"/*.deb out/
+            cp "dl/$m/SHA256SUMS" "out/SHA256SUMS-$m.txt"
+            built="$built $m"
+          done
+          if [ -z "$built" ]; then echo "::warning::No machine built successfully for $TAG; nothing to publish there"; continue; fi
+          ls -lh out
+          first=${built# }; first=${first%% *}
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            {
+              echo "linux-tkg $VER with the $SCHED scheduler, built automatically for:$built."
+              echo
+              echo "Each machine has its own linux-image and linux-headers package (the machine name is part of the file name) and a SHA256SUMS-<machine>.txt. Install on the matching machine with, for example:"
+              echo
+              echo "    sudo dpkg -i linux-image-*-${first}-*.deb linux-headers-*-${first}-*.deb"
+            } > notes.md
+            gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Linux $VER ($SCHED)" --notes-file notes.md
+          fi
+          echo "### Published $TAG for:$built" >> "$GITHUB_STEP_SUMMARY"
+          published="$published $TAG"
+        done < <(jq -r '.[] | [.tag, .scheduler, .machines] | @tsv' <<< "$RELEASES")
+        [ -n "$published" ] || { echo "::error::No machine built successfully; nothing to publish"; exit 1; }
